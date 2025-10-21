@@ -1,0 +1,3364 @@
+# Neural Continuous Flow Architecture (NCFA)
+## Especificación Técnica Completa para Implementación
+
+
+
+# ÍNDICE
+
+1. [Arquitectura General](#1-arquitectura-general)
+2. [Capa de Entrada: Wavelet Encoding](#2-capa-de-entrada-wavelet-encoding)
+3. [Embedding a Espacio de Fase](#3-embedding-a-espacio-de-fase)
+4. [Neural ODE: Dinámica del Sistema](#4-neural-ode-dinámica-del-sistema)
+5. [Sistema de Memoria: Atractores](#5-sistema-de-memoria-atractores)
+6. [Capa de Salida: Decodificación](#6-capa-de-salida-decodificación)
+7. [Entrenamiento](#7-entrenamiento)
+8. [Optimización y Escalabilidad](#8-optimización-y-escalabilidad)
+9. [Gestión de Contexto Extendido](#9-gestión-de-contexto-extendido)
+10. [Casos Edge y Robustez](#10-casos-edge-y-robustez)
+11. [Pipeline de Datos](#11-pipeline-de-datos)
+12. [Evaluación y Métricas](#12-evaluación-y-métricas)
+13. [Configuraciones de Modelos](#13-configuraciones-de-modelos)
+14. [Implementación por Fases](#14-implementación-por-fases)
+
+
+
+# 1. ARQUITECTURA GENERAL
+
+## 1.1 Flujo de Datos End-to-End
+
+```
+INPUT (texto/imagen/audio)
+    ↓
+[PREPROCESSING]
+    ↓
+[WAVELET TRANSFORM] → Coeficientes multiescala
+    ↓
+[EMBEDDING NETWORK] → Vector 10,000D (estado inicial)
+    ↓
+[NEURAL ODE SOLVER] → Trayectoria en espacio de fase
+    ↓
+[ATTRACTOR INTERACTION] → Resonancia con memoria
+    ↓
+[CONVERGENCE] → Estado final estabilizado
+    ↓
+[DECODER NETWORK] → Coeficientes wavelet de salida
+    ↓
+[INVERSE WAVELET] → Señal continua
+    ↓
+[POSTPROCESSING]
+    ↓
+OUTPUT (texto/imagen/audio)
+```
+
+
+## 1.2 Componentes Principales
+
+| Componente | Input | Output | Parámetros |
+|------------|-------|--------|------------|
+| WaveletEncoder | Señal cruda | Coeficientes [N×L] | Familia wavelet, niveles |
+| EmbeddingNet | Coefs [N×L] | Vector [D] | MLP: [N×L]→[D] |
+| ODEFunction | Estado [D], t | dh/dt [D] | MLP: [D]→[D] |
+| AttractorMemory | Estado [D] | Fuerzas [D] | M atractores [M×D] |
+| DecoderNet | Estado [D] | Coefs [N×L] | MLP: [D]→[N×L] |
+| WaveletDecoder | Coefs [N×L] | Señal cruda | Síntesis inversa |
+
+## 1.3 Dimensionalidades Clave
+
+**Modelo Base (1B parámetros):**
+- Espacio de fase: D = 10,000
+- Coeficientes wavelet: N×L ≈ 512 (depende de input)
+- Atractores en memoria: M = 1,000,000
+- Profundidad ODE: 100 pasos adaptativos
+
+**Modelo Grande (100B parámetros):**
+- Espacio de fase: D = 50,000
+- Coeficientes wavelet: N×L ≈ 2048
+- Atractores en memoria: M = 100,000,000
+- Profundidad ODE: 500 pasos adaptativos
+
+---
+
+# 2. CAPA DE ENTRADA: WAVELET ENCODING
+
+## 2.1 Preprocesamiento de Texto
+
+### Normalización
+```
+1. Convertir a lowercase (opcional, según caso de uso)
+2. Remover caracteres de control
+3. Normalización Unicode (NFC)
+4. NO tokenizar - mantener secuencia continua
+```
+
+### Conversión a Señal Numérica
+```
+Método 1: Character-level encoding
+- Cada carácter → valor Unicode (0-1114111)
+- Normalizar a rango [0, 1]: value / 1114111
+
+Método 2: Byte-level encoding
+- Cada byte → valor (0-255)
+- Normalizar a rango [0, 1]: value / 255
+
+ELEGIDO: Byte-level (más estable, vocabulario fijo de 256)
+```
+
+### Interpolación Continua
+```
+Input: Array discreto [x₁, x₂, x₃, ..., xₙ]
+Output: Función continua s(t) donde t ∈ [0, n-1]
+
+Método: Cubic Spline Interpolation
+- Garantiza continuidad C² (segunda derivada continua)
+- Biblioteca: scipy.interpolate.CubicSpline
+- Upsampling factor: 4x (cada carácter → 4 puntos)
+
+Ejemplo:
+Input: [0.28, 0.43, 0.42, 0.38] (4 caracteres)
+Output: 16 puntos interpolados suavemente
+```
+
+## 2.2 Transformada Wavelet
+
+### Familia de Wavelets Elegida
+```
+Primaria: Daubechies db8
+- 8 momentos nulos
+- Buen balance entre suavidad y localización
+- Soporte compacto de longitud 15
+
+Alternativa para audio: Morlet
+- Mejor para señales oscilatorias
+- Parámetro: ω₀ = 6 (compromise entre tiempo/frecuencia)
+
+Alternativa para imágenes: Coiflet coif3
+- Simetría casi perfecta
+```
+
+### Descomposición Multinivel
+```
+Niveles de descomposición: L = 5
+
+Nivel 1 (alta frecuencia): Detalles finos, cambios rápidos
+Nivel 2: Estructura de palabras
+Nivel 3: Estructura de frases
+Nivel 4: Estructura de párrafos
+Nivel 5 (baja frecuencia): Patrones globales
+
+Cada nivel produce:
+- Coeficientes de detalle: cDⱼ (capturan cambios)
+- Coeficientes de aproximación: cAⱼ (capturan tendencia)
+```
+
+### Manejo de Longitud Variable
+```
+Problema: Textos de diferentes longitudes → diferentes números de coeficientes
+
+Solución 1: Zero-padding
+- Pad hasta longitud máxima (ej: 2048 caracteres)
+- Llenar con ceros
+- Añadir máscara de atención
+
+Solución 2: Chunking adaptativo
+- Dividir textos largos en chunks de tamaño fijo
+- Procesar cada chunk independientemente
+- Combinar con pooling jerárquico
+
+ELEGIDO: Combinación híbrida
+- Chunks de 512 caracteres (máximo)
+- Overlap de 64 caracteres entre chunks
+- Padding dentro de cada chunk
+```
+
+### Output del Wavelet Transform
+```
+Para input de 512 caracteres (upsampled a 2048 puntos):
+
+Nivel 1: 1024 coeficientes
+Nivel 2: 512 coeficientes
+Nivel 3: 256 coeficientes
+Nivel 4: 128 coeficientes
+Nivel 5: 64 coeficientes + 64 aprox.
+
+Total: ~2048 coeficientes
+Flatten a vector unidimensional: [c₁, c₂, ..., c₂₀₄₈]
+```
+
+### Normalización de Coeficientes
+```
+Problema: Coeficientes tienen diferentes magnitudes por nivel
+
+Solución: Layer Normalization por nivel
+- Normalizar cada nivel independientemente
+- μ = 0, σ = 1
+- Aprender parámetros de escala γ y offset β
+
+Formula: norm(x) = γ · (x - μ)/σ + β
+```
+
+---
+
+# 3. EMBEDDING A ESPACIO DE FASE
+
+## 3.1 Arquitectura del Embedding Network
+
+### Estructura General
+```
+Input: Coeficientes wavelet [2048]
+Output: Estado en espacio de fase [10000]
+
+Arquitectura: MLP profundo con residual connections
+```
+
+### Especificación Capa por Capa
+
+**Modelo Base (1B params):**
+```
+Layer 1: Linear(2048 → 4096) + LayerNorm + GELU
+Layer 2: Linear(4096 → 6144) + LayerNorm + GELU + Dropout(0.1)
+Layer 3: Linear(6144 → 8192) + LayerNorm + GELU + Dropout(0.1)
+Layer 4: Linear(8192 → 10000) + LayerNorm
+
+Residual connections cada 2 capas
+Total params en embedding: ~150M
+```
+
+**Modelo Grande (100B params):**
+```
+16 capas con expansión progresiva
+2048 → 8192 → 16384 → 32768 → 50000
+Bottleneck attention en capas intermedias
+Total params: ~5B
+```
+
+### Funciones de Activación
+```
+Elegida: GELU (Gaussian Error Linear Unit)
+Formula: GELU(x) = x · Φ(x)
+donde Φ(x) es la CDF de la distribución normal estándar
+
+Ventajas sobre ReLU:
+- Suavidad (diferenciable en todo punto)
+- Mejor para ODEs (sin discontinuidades)
+- Performance empírico superior en NLP
+
+Alternativa: Swish (x · sigmoid(βx))
+- Similar performance
+- Parámetro aprendible β
+```
+
+### Normalización
+```
+Técnica: Layer Normalization (no Batch Norm)
+
+Razón: Batch norm problemático para secuencias variables
+LayerNorm normaliza por features, no por batch
+
+Implementación:
+- Aplicar después de cada linear layer
+- Antes de la activación
+- Parámetros aprendibles: γ (scale), β (shift)
+```
+
+### Regularización
+```
+Dropout: 0.1 en capas intermedias
+- NO en primera ni última capa
+- Ayuda a prevenir overfitting
+- Durante inferencia: desactivar
+
+Weight Decay: λ = 0.01
+- L2 regularization en pesos
+- Mantiene normas de pesos pequeñas
+```
+
+### Inicialización de Pesos
+```
+Método: Xavier/Glorot initialization con ajuste
+
+Formula: W ~ N(0, √(2/(fan_in + fan_out)))
+
+Para ODEs específicamente:
+- Inicializar con menor varianza (0.5×)
+- Previene explosión inicial
+- Bias inicializado a 0
+```
+
+## 3.2 Proyección Manifold
+
+### Concepto
+```
+El espacio de fase de 10,000D no es euclidiano plano
+Es un manifold de menor dimensión intrínseca embebido en 10,000D
+
+Dimensión intrínseca estimada: ~500-1000D
+```
+
+### Regularización Manifold
+```
+Técnica: Contractive regularization
+
+Objetivo: Forzar que puntos cercanos en espacio wavelet
+          mapeen a puntos cercanos en espacio de fase
+
+Pérdida adicional:
+L_manifold = ||∂h/∂w||²_F
+
+donde h = embedding(w)
+Penaliza Jacobiano grande (cambios bruscos)
+```
+
+### Clustering Inicial
+```
+Durante entrenamiento temprano:
+- Pre-entrenar con k-means en espacio de fase
+- 10,000 clusters iniciales
+- Asegurar que conceptos similares estén cerca
+
+Métrica de distancia: Cosine similarity (no euclidiana)
+```
+
+---
+
+# 4. NEURAL ODE: DINÁMICA DEL SISTEMA
+
+## 4.1 Formulación Matemática
+
+### Ecuación Diferencial Ordinaria
+```
+dh/dt = f_θ(h(t), c(t), t)
+
+Donde:
+- h(t) ∈ ℝ¹⁰⁰⁰⁰: estado del sistema en tiempo t
+- c(t) ∈ ℝ¹⁰⁰⁰⁰: contexto de memoria (atractores activos)
+- t ∈ [0, T]: tiempo de integración (pseudo-tiempo)
+- f_θ: función neural parametrizada
+
+Interpretación:
+- h(0) = embedding del input
+- h(T) = estado final (después de "pensar")
+- El sistema "fluye" de h(0) a h(T)
+```
+
+### Propiedades Deseadas
+```
+1. Lipschitz continuity: ||f(h₁) - f(h₂)|| ≤ L||h₁ - h₂||
+   - Garantiza estabilidad numérica
+   - L ≈ 10 para nuestro sistema
+
+2. Preservación de energía aproximada:
+   - E(h(T)) ≈ E(h(0)) + trabajo_externo
+   - Previene explosión o colapso
+
+3. Reversibilidad (opcional):
+   - Poder integrar hacia atrás: h(0) = ∫ -f_θ dt
+   - Útil para interpretabilidad
+```
+
+## 4.2 Arquitectura de f_θ (ODEFunc)
+
+### Diseño de Red Neural
+
+**Opción 1: MLP Profundo (baseline)**
+```
+Input: h(t) [10000], c(t) [10000], t [1]
+Concatenate: [h; c; t] → [20001]
+
+Layer 1: Linear(20001 → 15000) + LayerNorm + Tanh
+Layer 2: Linear(15000 → 12000) + LayerNorm + Tanh + Dropout(0.05)
+Layer 3: Linear(12000 → 10000)
+
+Output: dh/dt [10000]
+
+Params: ~450M para modelo base
+```
+
+**Opción 2: Attention-like (avanzado)**
+```
+NO usar self-attention clásica (queremos evitar O(n²))
+
+Usar: Linear Attention o Performer-style attention
+- Complejidad O(n) en lugar de O(n²)
+- Basado en kernelización
+
+Estructura:
+1. Query/Key/Value projections: h → Q, K, V
+2. Kernel approximation: φ(Q), φ(K)
+3. Attention: (φ(Q) · φ(K)ᵀ) · V / normalización
+4. Feed-forward MLP
+
+Params: ~800M para modelo base
+```
+
+**Opción 3: Híbrido (recomendado)**
+```
+Combinar MLP con sparse attention local
+
+Estructura:
+1. Local attention: solo entre vecinos cercanos (radio r=50)
+2. MLP para mezcla global
+3. Residual connections
+
+Layer 1: Local Attention(10000 → 10000)
+Layer 2: MLP(10000 → 15000 → 10000)
+Layer 3: Residual add + LayerNorm
+
+Params: ~500M
+Balance entre expresividad y eficiencia
+```
+
+### Activaciones para ODEs
+```
+CRÍTICO: NO usar ReLU (discontinuo)
+
+Elegida: Tanh
+- Acotada: output ∈ [-1, 1]
+- Suave (infinitamente diferenciable)
+- Previene explosión de gradientes
+
+Alternativas:
+- Softplus: log(1 + e^x) - suave, no acotada
+- ELU: mejor que ReLU pero menos que Tanh para ODEs
+```
+
+### Dependencia Temporal Explícita
+```
+Incorporar t (tiempo de integración) explícitamente
+
+Método 1: Concatenación simple
+- Agregar t como feature adicional
+- Problema: información puede ser ignorada
+
+Método 2: Modulación por tiempo (RECOMENDADO)
+- Usar t para modular activaciones
+- Formula: h * (1 + α·sin(ωt))
+- α, ω aprendibles por capa
+
+Método 3: Time embeddings
+- Posicional encoding sinusoidal
+- PE(t) = [sin(ω₁t), cos(ω₁t), ..., sin(ωₖt), cos(ωₖt)]
+- Concatenar con h
+```
+
+## 4.3 Solver ODE
+
+### Método de Integración
+```
+Elegido: Dormand-Prince (dopri5)
+- Runge-Kutta de orden 5 con paso adaptativo
+- Control de error automático
+- Eficiente y estable
+
+Alternativas:
+- Euler: muy simple, requiere pasos pequeños
+- RK4: fijo, menos adaptable
+- Adams-Bashforth: para sistemas muy suaves
+```
+
+### Configuración del Solver
+```
+Parámetros:
+- rtol (relative tolerance): 1e-3
+  * Controla error relativo
+  * Menor = más preciso pero más lento
+  
+- atol (absolute tolerance): 1e-4
+  * Controla error absoluto
+  * Importante cuando ||h|| es pequeña
+
+- method: 'dopri5'
+
+- t_span: [0, T_max]
+  * T_max = 10.0 para inferencia normal
+  * T_max adaptativo para problemas difíciles
+
+- step_size_control: True
+  * Ajusta dt automáticamente
+  * dt_min = 1e-5, dt_max = 1.0
+```
+
+### Tiempo de Integración Adaptativo
+```
+Idea: Problemas simples necesitan menos tiempo
+
+Mecanismo:
+1. Integrar hasta T=10 inicialmente
+2. Cada paso, calcular métrica de convergencia:
+   convergence = ||dh/dt|| / ||h||
+3. Si convergence < threshold (ej: 0.01):
+   - DETENER integración temprano
+   - Ahorrar compute
+
+Resultado:
+- Preguntas simples: T_effective ≈ 2-3
+- Razonamiento complejo: T_effective ≈ 10-20
+```
+
+### Checkpointing para Memoria
+```
+Problema: Backprop a través de ODE requiere almacenar trayectoria completa
+
+Solución: Adjoint method (gradientes adjuntos)
+
+En lugar de almacenar todos los estados h(t):
+1. Forward pass: solo guardar h(0) y h(T)
+2. Backward pass: integrar ODE adjunta hacia atrás
+3. Recuperar gradientes sin almacenar trayectoria
+
+Memoria: O(1) en lugar de O(T/dt)
+Trade-off: ~2x más cómputo en backward
+```
+
+### Estabilidad Numérica
+```
+Control de Lyapunov para prevenir caos
+
+Lyapunov exponent: λ = lim(t→∞) (1/t) log(||δh(t)||/||δh(0)||)
+
+Si λ > 0: sistema caótico, inestable
+Si λ < 0: sistema estable, convergente
+
+Durante entrenamiento:
+- Monitorear λ cada 1000 steps
+- Si λ > 0.5: aumentar regularización
+- Agregar término de pérdida: L_lyap = max(0, λ - 0.1)
+```
+
+---
+
+# 5. SISTEMA DE MEMORIA: ATRACTORES
+
+## 5.1 Representación de Atractores
+
+### Estructura de Datos
+```
+Cada atractor A_i contiene:
+
+1. center: Vector [10000]
+   - Posición en espacio de fase
+
+2. energy: Float
+   - Profundidad del "valle"
+   - Rango: [0, 1]
+   - Mayor energía = más estable
+
+3. radius: Float
+   - Radio de influencia
+   - Determina cuán lejos afecta
+   - Rango: [0.1, 10.0]
+
+4. covariance: Matriz [10000 × 10000] (opcional, comprimida)
+   - Forma del atractor (esférico vs elipsoidal)
+   - Almacenar solo eigenvalues + eigenvectors top-K
+   - K=100 típicamente suficiente
+
+5. decay_rate: Float
+   - Tasa de olvido λ
+   - Rango: [1e-6, 1e-3]
+   - Mayor = olvida más rápido
+
+6. creation_time: Timestamp
+   - Cuándo se creó
+
+7. last_access_time: Timestamp
+   - Última vez activado
+
+8. access_count: Integer
+   - Número de veces recuperado
+   - Usado para reinforcement
+
+9. metadata: Dict
+   - context_tags: lista de conceptos
+   - importance_level: [0-5]
+   - parent_attractors: IDs de atractores relacionados
+   - children_attractors: IDs de atractores derivados
+```
+
+### Tipos de Atractores
+
+**Nivel 1: Atractores de Punto**
+```
+Representan: Conceptos individuales concretos
+Ejemplo: "gato", "rojo", "París"
+
+Características:
+- Radio pequeño (r ≈ 0.5)
+- Alta energía (E ≈ 0.8)
+- Forma esférica (covarianza isotrópica)
+```
+
+**Nivel 2: Ciclos Límite**
+```
+Representan: Patrones, relaciones, secuencias
+Ejemplo: "verbo-objeto", "causa-efecto"
+
+Características:
+- No un punto sino una órbita cerrada
+- Definido por: centro + frecuencia + amplitud
+- Radio medio (r ≈ 2.0)
+- Energía media (E ≈ 0.5)
+
+Implementación:
+- Almacenar trayectoria como spline
+- Parametrizar por θ ∈ [0, 2π]
+- Atractor(θ) = center + A·cos(θ)·v₁ + A·sin(θ)·v₂
+  donde v₁, v₂ son vectores ortogonales
+```
+
+**Nivel 3: Atractores Caóticos**
+```
+Representan: Razonamiento complejo, meta-conceptos
+Ejemplo: "paradoja", "ironía", "analogía compleja"
+
+Características:
+- Atractor extraño (fractal)
+- Comportamiento semi-caótico
+- Radio grande (r ≈ 5.0)
+- Energía variable
+
+Implementación:
+- Usar sistema de Lorenz simplificado
+- dx/dt = σ(y - x)
+- dy/dt = x(ρ - z) - y  
+- dz/dt = xy - βz
+- Parámetros σ, ρ, β aprendibles
+```
+
+## 5.2 Creación y Actualización de Atractores
+
+### Criterios para Crear Nuevo Atractor
+
+```
+Al procesar input, después de ODE converge a h_final:
+
+1. Buscar atractores existentes cercanos:
+   distances = [||h_final - A_i.center|| for all A_i]
+   nearest = min(distances)
+
+2. Decisión:
+   IF nearest < threshold_new (ej: 0.5):
+       → NO crear nuevo, reforzar existente
+   ELSE:
+       → Crear nuevo atractor
+
+3. Si crear nuevo:
+   - center = h_final
+   - energy = base_energy (0.3) + importance_boost
+   - radius = default_radius (1.0)
+   - decay_rate = default_decay (1e-5)
+```
+
+### Reforzamiento de Atractor Existente
+```
+Cuando h_final cae en cuenca de A_i:
+
+1. Actualizar centro (moving average):
+   A_i.center ← α·h_final + (1-α)·A_i.center
+   donde α = learning_rate (0.01)
+
+2. Aumentar energía:
+   A_i.energy ← min(1.0, A_i.energy + δ_reinforce)
+   donde δ_reinforce = 0.05
+
+3. Actualizar covarianza (si se usa):
+   Añadir h_final a conjunto de puntos
+   Recalcular covarianza cada N visitas
+
+4. Resetear decay:
+   A_i.last_access_time = now()
+   A_i.access_count += 1
+```
+
+### Olvido y Decay
+```
+Proceso periódico (cada N pasos de entrenamiento):
+
+FOR each atractor A_i:
+    time_since_access = now() - A_i.last_access_time
+    
+    # Decay exponencial
+    A_i.energy *= exp(-A_i.decay_rate * time_since_access)
+    
+    # Si energía muy baja, eliminar
+    IF A_i.energy < threshold_delete (0.05):
+        DELETE A_i
+```
+
+### Gestión de Memoria con Millones de Atractores
+```
+Problema: 1M atractores × 10000D × 4 bytes = 40GB RAM
+
+Soluciones:
+
+1. Cuantización:
+   - Almacenar en float16 en vez de float32
+   - Reduce a 20GB
+   - Pérdida mínima de precisión
+
+2. Clustering jerárquico:
+   - Agrupar atractores similares
+   - Almacenar solo centroides de clusters
+   - Expandir cuando se necesita
+   - Reduce memoria activa a ~5GB
+
+3. Paging a disco:
+   - Mantener atractores frecuentes en RAM (hot cache)
+   - Atractores raros en SSD (cold storage)
+   - LRU policy para gestionar cache
+
+4. Compresión por PCA:
+   - Muchos atractores viven en subespacio de menor dim
+   - Proyectar a top-K componentes principales (K=1000)
+   - Reduce 10,000D → 1,000D
+   - Reconstrucción aproximada cuando se necesita
+```
+
+## 5.3 Función de Atracción
+
+### Cálculo de Fuerza
+```
+Dado estado actual h y atractor A_i, calcular fuerza:
+
+Opción 1: Lineal (simple)
+F_i(h) = -k · (h - A_i.center)
+donde k = A_i.energy / A_i.radius
+
+Opción 2: Armónica (recomendada)
+F_i(h) = -k · (h - A_i.center) · exp(-||h - A_i.center||² / (2σ²))
+donde σ = A_i.radius, k = A_i.energy
+
+Opción 3: Lennard-Jones (avanzada)
+F_i(h) = ε·[(σ/r)¹² - 2(σ/r)⁶]
+- Atractiva a media distancia
+- Repulsiva muy cerca (previene colapso)
+```
+
+### Combinación de Múltiples Atractores
+```
+Sistema tiene M atractores, calcular fuerza total:
+
+F_total(h) = Σᵢ wᵢ · F_i(h)
+
+Donde wᵢ = peso basado en:
+1. Distancia: wᵢ ∝ exp(-dist_i²/2σ²)
+2. Energía: wᵢ ∝ A_i.energy
+3. Relevancia contextual: wᵢ ∝ dot(h, A_i.center)
+
+Normalizar: Σᵢ wᵢ = 1
+```
+
+### Activación Selectiva (Eficiencia)
+```
+No calcular fuerza de TODOS los atractores (muy costoso)
+
+Estrategia: Activación Top-K
+
+1. Spatial indexing:
+   - Usar KD-tree o Ball-tree para atractores
+   - Búsqueda de K vecinos más cercanos: O(log M)
+
+2. Para cada paso ODE:
+   - Buscar K=50 atractores más cercanos a h(t)
+   - Solo calcular fuerzas de esos K
+   - Ignorar los otros (fuerza ≈ 0 por distancia)
+
+3. Actualizar selección cada N pasos (N=5)
+   - No recalcular vecinos cada paso
+   - Trade-off precisión vs velocidad
+```
+
+### Integración con ODE
+```
+Modificar ecuación ODE para incluir atractores:
+
+dh/dt = f_θ(h, t) + F_attractors(h)
+
+Donde:
+- f_θ(h, t): dinámica intrínseca (red neural)
+- F_attractors(h): fuerza de atractores (memoria)
+
+Implementación en código:
+1. ODEFunc.forward(h, t):
+     intrinsic = neural_net(h, t)
+     memory = attractor_system.get_force(h)
+     return intrinsic + λ_memory * memory
+
+λ_memory = 0.1 típicamente (balancear exploración vs memoria)
+```
+
+---
+
+# 6. CAPA DE SALIDA: DECODIFICACIÓN
+
+## 6.1 Arquitectura del Decoder
+
+### Red Neural Inversa
+```
+Input: Estado final h(T) [10000]
+Output: Coeficientes wavelet [2048]
+
+Arquitectura: MLP (simétrico al encoder)
+
+Layer 1: Linear(10000 → 8192) + LayerNorm + GELU
+Layer 2: Linear(8192 → 6144) + LayerNorm + GELU + Dropout(0.1)
+Layer 3: Linear(6144 → 4096) + LayerNorm + GELU + Dropout(0.1)
+Layer 4: Linear(4096 → 2048)
+
+Output: [cD₁, cD₂, ..., cD₅, cA₅] coeficientes por nivel
+```
+
+### Condicionamiento por Modalidad
+```
+Si sistema multimodal (texto + imagen + audio):
+
+Añadir embedding de modalidad:
+- Text: [1, 0, 0]
+- Image: [0, 1, 0]
+- Audio: [0, 0, 1]
+
+Concatenar con h(T):
+input_decoder = [h(T); modality_embedding]
+
+Decoder aprende decodificación específica por modalidad
+```
+
+## 6.2 Reconstrucción Wavelet Inversa
+
+### Proceso
+```
+1. Recibir coeficientes del decoder: [c₁, c₂, ..., c₂₀₄₈]
+
+2. Reorganizar por niveles:
+   cD₁ = c[0:1024]      (detalles nivel 1)
+   cD₂ = c[1024:1536]   (detalles nivel 2)
+   cD₃ = c[1536:1792]   (detalles nivel 3)
+   cD₄ = c[1792:1920]   (detalles nivel 4)
+   cD₅ = c[1920:1984]   (detalles nivel 5)
+   cA₅ = c[1984:2048]   (aproximación nivel 5)
+
+3. Aplicar transformada wavelet inversa (IDWT):
+   Biblioteca: pywt.waverec()
+   Input: [cA₅, cD₅, cD₄, cD₃, cD₂, cD₁]
+   Output: señal_reconstruida [2048 puntos]
+
+4. Downsampling (reverso de interpolación):
+   2048 puntos → 512 puntos
+   Método: decimación uniforme (tomar cada 4to punto)
+```
+
+### Desnormalización
+```
+La señal está en rango [0, 1]
+Convertir a bytes o caracteres:
+
+Para texto (byte-level):
+- Multiplicar por 255
+- Redondear a enteros
+- Convertir a caracteres: chr(int(value))
+
+Para audio:
+- Multiplicar por rango dinámico (ej: [-1, 1])
+- Convertir a formato de audio (16-bit PCM)
+
+Para imagen:
+- Reshape a (H, W, C)
+- Multiplicar por 255
+- Convertir a uint8
+```
+
+### Manejo de Artefactos
+```
+Problema: Reconstrucción puede tener valores fuera de rango válido
+
+Soluciones:
+1. Clipping:
+   output = clip(output, min=0, max=255)
+
+2. Sigmoid en última capa del decoder:
+   - Fuerza output a [0, 1]
+   - Más estable pero menos expresivo
+
+3. Postprocesamiento adaptativo:
+   - Detectar outliers (valores > 3σ)
+   - Suavizar con filtro gaussiano local
+```
+
+## 6.3 Generación Autoregresiva vs One-Shot
+
+### Modo One-Shot (recomendado para respuestas cortas)
+```
+Proceso:
+1. Encodear pregunta completa
+2. ODE converge a h(T)
+3. Decodificar h(T) → respuesta completa de una vez
+
+Ventajas:
+- Muy rápido (single forward pass)
+- Respuesta coherente globalmente
+- No acumula errores
+
+Limitaciones:
+- Longitud fija de output (512 caracteres max)
+- Difícil para generación muy larga
+```
+
+### Modo Autoregresivo (para respuestas largas)
+```
+Proceso iterativo:
+
+Iteración 1:
+- Input: pregunta
+- Output chunk 1: primeros 512 caracteres
+
+Iteración 2:
+- Input: [pregunta; chunk 1]
+- Output chunk 2: siguientes 512 caracteres
+
+Continuar hasta:
+- Detectar token de fin </s>
+- Alcanzar longitud máxima
+- Convergencia (output repetitivo)
+
+Ventajas:
+- Longitud ilimitada
+- Control fino de generación
+
+Limitaciones:
+- Más lento (múltiples forward passes)
+- Puede perder coherencia a largo plazo
+```
+
+### Modo Híbrido (óptimo)
+```
+Estrategia adaptativa:
+
+1. Clasificar query:
+   - Simple/corta → One-shot
+   - Compleja/larga → Autoregresivo
+
+2. Clasificador ligero:
+   Input: embedding de query
+   Output: probability(requiere_autoregresivo)
+   
+3. Para autoregresivo:
+   - Mantener atractores activos entre iteraciones
+   - Estado h(T) de iteración anterior como contexto
+   - Evita recomputar desde cero
+```
+
+---
+
+# 7. ENTRENAMIENTO
+
+## 7.1 Función de Pérdida Completa
+
+### Componentes de la Pérdida
+```
+L_total = λ₁·L_reconstruction + 
+          λ₂·L_dynamics + 
+          λ₃·L_stability + 
+          λ₄·L_attractor +
+          λ₅·L_regularization
+
+Pesos recomendados:
+λ₁ = 1.0   (reconstrucción es primaria)
+λ₂ = 0.1   (suavidad de flujo)
+λ₃ = 0.05  (estabilidad de atractores)
+λ₄ = 0.2   (coherencia de memoria)
+λ₅ = 0.01  (regularización)
+```
+
+### L_reconstruction: Pérdida de Reconstrucción
+```
+Opción 1: MSE en espacio de coeficientes wavelet
+L_recon = ||ŷ - y||²
+donde:
+- y: coeficientes wavelet ground truth
+- ŷ: coeficientes predichos por decoder
+
+Opción 2: MSE + pérdida perceptual
+L_recon = ||ŷ - y||² + λ_percep·||φ(ŷ) - φ(y)||²
+donde φ() es una red pre-entrenada (ej: encoder congelado)
+
+Opción 3: Weighted MSE (RECOMENDADA)
+L_recon = Σᵢ wᵢ·(ŷᵢ - yᵢ)²
+donde wᵢ es mayor para coeficientes de baja frecuencia
+(son más importantes semánticamente)
+
+Específicamente:
+w[nivel 5] = 5.0  (aproximación, muy importante)
+w[nivel 4] = 2.0
+w[nivel 3] = 1.0
+w[nivel 2] = 0.5
+w[nivel 1] = 0.2  (detalles finos, menos crítico)
+```
+
+### L_dynamics: Suavidad del Flujo
+```
+Objetivo: Penalizar trayectorias erráticas en ODE
+
+Métrica: Segunda derivada (curvatura)
+
+L_dynamics = ∫₀ᵀ ||d²h/dt²||² dt
+
+Aproximación discreta:
+Durante integración, samplear estados:
+h₀, h₁, h₂, ..., hₙ a tiempos t₀, t₁, ..., tₙ
+
+Calcular aceleración:
+aᵢ = (hᵢ₊₁ - 2hᵢ + hᵢ₋₁) / Δt²
+
+L_dynamics = (1/n) Σᵢ ||aᵢ||²
+
+Efecto: Fuerza trayectorias suaves, previene oscilaciones
+```
+
+### L_stability: Estabilidad de Atractores
+```
+Objetivo: Atractores deben ser estables (no moverse mucho)
+
+Para cada atractor Aᵢ:
+- Almacenar posición en época anterior: Aᵢ_prev
+- Calcular desplazamiento: Δᵢ = ||Aᵢ.center - Aᵢ_prev.center||
+
+L_stability = (1/M) Σᵢ (Δᵢ)²
+
+Variante: Solo penalizar atractores maduros
+- Si access_count > threshold (ej: 100):
+  - Aplicar penalización completa
+- Si access_count < threshold:
+  - Permitir más movimiento (nuevos atractores se ajustan)
+
+L_stability = Σᵢ min(access_count_i / 100, 1.0) · (Δᵢ)²
+```
+
+### L_attractor: Coherencia de Memoria
+```
+Objetivo: Atractores similares deben estar cerca
+
+Método: Contrastive learning en espacio de atractores
+
+Positive pairs: Conceptos relacionados
+- "gato" y "felino"
+- "rojo" y "carmesí"
+
+Negative pairs: Conceptos no relacionados
+- "gato" y "montaña"
+
+L_attractor = -log(exp(sim(A₊, Aᵢ)/τ) / Σⱼ exp(sim(Aⱼ, Aᵢ)/τ))
+
+donde:
+- A₊: atractor positivo (relacionado)
+- Aⱼ: todos los atractores (positivos + negativos)
+- sim(A₁, A₂) = dot(A₁.center, A₂.center) / (||A₁||·||A₂||)
+- τ = temperatura (0.07 típicamente)
+
+Construir pares:
+- Minar de datos: palabras que co-ocurren → positivos
+- Palabras aleatorias → negativos
+```
+
+### L_regularization: Regularización
+```
+Componentes:
+
+1. Weight decay (L2):
+   L_l2 = λ_wd Σ_θ ||θ||²
+   λ_wd = 0.01
+
+2. Contractive penalty (embedding):
+   L_contract = ||∂h/∂input||²_F
+   Previene que pequeños cambios en input causen grandes cambios
+
+3. Energy conservation (ODE):
+   E(h) = ||h||²
+   L_energy = |E(h(T)) - E(h(0))|²
+   Previene explosión o colapso de norma
+
+4. Lipschitz constraint (f_θ):
+   Estimar: Lip(f) ≈ max(||f(h₁) - f(h₂)|| / ||h₁ - h₂||)
+   L_lipschitz = max(0, Lip(f) - L_max)²
+   L_max = 10.0 típicamente
+```
+
+## 7.2 Optimización
+
+### Algoritmo de Optimización
+```
+Elegido: AdamW (Adam con decoupled weight decay)
+
+Parámetros:
+- learning_rate: 3e-4 (inicial)
+- betas: (0.9, 0.999)
+- epsilon: 1e-8
+- weight_decay: 0.01
+
+Ventajas sobre Adam:
+- Mejor separación entre gradiente y regularización
+- Converge más establemente
+- Generaliza mejor
+```
+
+### Learning Rate Schedule
+```
+Estrategia: Warmup + Cosine Annealing
+
+Fase 1 - Warmup (primeros 10k steps):
+lr(step) = lr_max · (step / 10000)
+
+Fase 2 - Cosine decay:
+lr(step) = lr_min + 0.5·(lr_max - lr_min)·(1 + cos(π·step/T_max))
+
+donde:
+- lr_max = 3e-4
+- lr_min = 3e-6
+- T_max = total_steps
+
+Razón del warmup:
+- ODEs son sensibles a inicialización
+- Learning rate grande al inicio puede desestabilizar
+```
+
+### Gradient Clipping
+```
+CRÍTICO para estabilidad de ODEs
+
+Método: Clip by global norm
+
+max_grad_norm = 1.0
+
+Para cada batch:
+1. Calcular norma global: g_norm = sqrt(Σ ||∇θ||²)
+2. Si g_norm > max_grad_norm:
+     ∇θ ← ∇θ · (max_grad_norm / g_norm)
+
+Previene explosión de gradientes durante backprop a través de ODE
+```
+
+### Batch Size y Acumulación
+```
+Configuración para modelo base:
+
+Effective batch size: 512
+Micro batch size: 16 (por GPU)
+Gradient accumulation steps: 32
+
+Total: 16 × 32 = 512
+
+Razón:
+- Batch grande → gradientes más estables
+- Pero GPU memory limitada
+- Acumular gradientes simula batch grande
+```
+
+### Mixed Precision Training
+```
+Usar: Automatic Mixed Precision (AMP)
+
+Componentes en float16:
+- Forward pass de redes neurales
+- Gradientes
+- Optimización
+
+Componentes en float32:
+- Pérdidas
+- Normalización
+- Atractores (requieren precisión)
+
+Ventajas:
+- 2x speedup
+- 50% menos memoria
+- Pérdida mínima de precisión con loss scaling
+```
+
+## 7.3 Estrategia de Entrenamiento
+
+### Curriculum Learning por Fases
+
+**Fase 1: Dinámica Básica (epochs 1-5)**
+```
+Objetivo: Aprender flujo estable sin memoria
+
+Configuración:
+- Desactivar atractores (λ₄ = 0)
+- Simplificar ODEs (menos capas)
+- Tareas simples: autoencoding
+
+Dataset:
+- Secuencias cortas (50-100 caracteres)
+- Textos simples, repetitivos
+
+Métricas de éxito:
+- Reconstruction loss < 0.1
+- ODE convergence rate > 95%
+```
+
+**Fase 2: Introducir Memoria (epochs 6-15)**
+```
+Objetivo: Crear atractores para conceptos básicos
+
+Configuración:
+- Activar atractores (λ₄ = 0.1 → 0.2)
+- Aumentar complejidad de ODEs
+- Tareas: Q&A simple con contexto corto
+
+Dataset:
+- Pares pregunta-respuesta
+- Context window: 200-500 caracteres
+
+Métricas:
+- Attractor coverage: % de conceptos con atractor
+- Memory recall: % de info recuperada correctamente
+```
+
+**Fase 3: Razonamiento Complejo (epochs 16-30)**
+```
+Objetivo: Razonamiento multi-paso, contexto largo
+
+Configuración:
+- Todos los componentes activos
+- Aumentar T_max de ODE (más tiempo de "pensamiento")
+- Tareas: razonamiento, resumen, diálogo
+
+Dataset:
+- Textos largos (1000+ caracteres)
+- Multi-turn conversations
+- Reasoning benchmarks
+
+Métricas:
+- Accuracy en tareas de razonamiento
+- Coherencia de diálogo (evaluación humana)
+```
+
+### Técnicas de Regularización Durante Entrenamiento
+
+**Dropout Scheduling**
+```
+Variar dropout rate durante entrenamiento:
+
+Epochs 1-10: dropout = 0.2 (más agresivo)
+Epochs 11-20: dropout = 0.1
+Epochs 21+: dropout = 0.05 (minimal)
+
+Razón: Prevenir overfitting temprano, luego permitir más capacidad
+```
+
+**Attractor Pruning**
+```
+Cada 1000 steps:
+1. Identificar atractores débiles (energy < 0.1)
+2. Verificar si son redundantes (muy cerca de otros)
+3. Eliminar o fusionar
+
+Previene: Acumulación de atractores inútiles
+Beneficio: Memoria eficiente, mejor recuperación
+```
+
+**Noise Injection**
+```
+Durante entrenamiento, añadir ruido en múltiples puntos:
+
+1. Input noise:
+   h(0) ← h(0) + ε, ε ~ N(0, σ_input²)
+   σ_input = 0.01
+
+2. ODE noise (opcional):
+   dh/dt = f_θ(h, t) + ε(t)
+   Simula incertidumbre, mejora robustez
+
+3. Attractor noise:
+   A.center ← A.center + ε
+   Durante lectura únicamente
+```
+
+---
+
+# 8. OPTIMIZACIÓN Y ESCALABILIDAD
+
+## 8.1 Paralelización
+
+### Data Parallelism
+```
+Estrategia estándar: Distribuir batches entre GPUs
+
+Setup para 8 GPUs:
+- Batch total: 512
+- Batch por GPU: 64
+- Cada GPU hace forward + backward independiente
+- Sincronizar gradientes con AllReduce
+- Actualizar pesos idénticamente en todas GPUs
+
+Librería: PyTorch DistributedDataParallel (DDP)
+```
+
+### Model Parallelism (para modelos muy grandes)
+```
+Cuando modelo no cabe en single GPU (100B+ params):
+
+Estrategia: Pipeline parallelism + Tensor parallelism
+
+Pipeline:
+- GPU 1: Encoder (wavelet → embedding)
+- GPU 2-5: ODE solver (4-way split de f_θ)
+- GPU 6: Attractor system
+- GPU 7: Decoder
+- GPU 8: Loss computation
+
+Tensor:
+- Dividir dimensiones de matrices
+- Ej: Linear(10000 → 10000) split en 4 GPUs
+- Cada GPU maneja Linear(10000 → 2500)
+```
+
+### ODE Parallelization
+```
+Problema: Integrar ODE es secuencial en t
+
+Solución parcial: Parallel-in-time methods
+
+Método: Parareal algorithm
+1. Dividir [0, T] en K segmentos
+2. Integración gruesa en paralelo
+3. Corrección fina secuencial
+4. Iterar hasta convergencia
+
+Speedup: ~2-3x con 8 cores
+Complejidad: Alta, solo para modelos grandes
+```
+
+## 8.2 Optimizaciones de Memoria
+
+### Gradient Checkpointing
+```
+Trade-off: Memoria por cómputo
+
+En lugar de almacenar todos los activations:
+1. Solo guardar activations de ciertas capas
+2. Recomputar activations intermedios en backward
+
+Para ODE:
+- Almacenar h(0), h(T/4), h(T/2), h(3T/4), h(T)
+- Recomputar segmentos según se necesiten
+
+Reducción de memoria: 5x-10x
+Overhead de cómputo: ~30%
+```
+
+### Attractor Memory Management
+
+**Hierarchical Storage**
+```
+3 niveles de almacenamiento:
+
+Nivel 1 - GPU VRAM (hot):
+- Top 10k atractores más accedidos
+- Acceso: ~100 ns
+- Capacidad: ~4GB
+
+Nivel 2 - CPU RAM (warm):
+- 100k atractores medianamente activos
+- Acceso: ~1 μs (PCIe transfer)
+- Capacidad: ~40GB
+
+Nivel 3 - SSD (cold):
+- Todos los demás (millones)
+- Acceso: ~100 μs
+- Capacidad: ~TB
+
+Gestión con LRU cache:
+- Promover a nivel superior cuando se accede
+- Degradar a nivel inferior cuando no se usa
+```
+
+**Compression**
+```
+Atractores en cold storage:
+
+1. Quantization:
+   float32 → int8 para centro
+   Mantener escala y offset para desquantizar
+   Reducción: 4x
+
+2. Clustering:
+   Agrupar atractores similares
+   Almacenar solo centroide + offsets
+   Reducción: 10x-100x para atractores redundantes
+
+3. Pruning:
+   Eliminar dimensiones menos importantes
+   PCA: 10000D → 1000D para atractores antiguos
+   Reducción: 10x
+```
+
+## 8.3 Optimizaciones de Inferencia
+
+### KV Cache Equivalent
+```
+Para generación autoregresiva:
+
+Problema: Recalcular encoder + ODE para cada token es caro
+
+Solución: Cache de estado
+
+1. Primera iteración:
+   - Computar h(T) completo
+   - Guardar en cache: {input_hash: h(T)}
+
+2. Iteraciones siguientes:
+   - Input = [input_prev; new_tokens]
+   - Recuperar h_prev(T) de cache
+   - Solo procesar new_tokens
+   - Combinar: h_new = α·h_prev + (1-α)·process(new_tokens)
+
+Speedup: 5x-10x para conversaciones largas
+```
+
+### Speculative Decoding
+```
+Para generación más rápida:
+
+Idea: Usar modelo pequeño para drafts, grande para verificación
+
+1. Modelo pequeño (100M params) genera K tokens
+2. Modelo grande (100B params) verifica en paralelo
+3. Aceptar tokens correctos, rechazar y regenerar incorrectos
+
+Speedup típico: 2-3x
+Calidad: Idéntica al modelo grande
+```
+
+### Batched Inference
+```
+Procesar múltiples queries simultáneamente:
+
+Challenge: Diferentes queries necesitan diferentes T de integración
+
+Solución: Bucketing por complejidad
+
+1. Clasificar queries en buckets:
+   - Simple (T_max = 5)
+   - Medium (T_max = 10)
+   - Complex (T_max = 20)
+
+2. Procesar cada bucket juntos
+   - Todas queries en bucket convergen a mismo tiempo
+   - Eficiencia de batch processing
+
+3. Criterio de clasificación:
+   - Length-based (simple)
+   - Learned classifier (mejor)
+```
+
+### Quantization para Inferencia
+```
+Reducir precisión sin perder calidad:
+
+INT8 quantization:
+- Encoder/Decoder: float32 → int8
+- ODE function: float32 → int8
+- Atractores: float32 → int8
+- Solo pérdidas/optimización en float32
+
+Método: Post-training quantization
+1. Entrenar modelo completo en float32
+2. Calibrar con dataset representativo
+3. Determinar rangos de activación
+4. Convertir pesos a int8
+
+Beneficios:
+- 4x menos memoria
+- 2-3x más rápido (int8 ops más rápidas)
+- Pérdida de calidad: <2% típicamente
+```
+
+---
+
+# 9. GESTIÓN DE CONTEXTO EXTENDIDO
+
+## 9.1 Arquitectura de Memoria Jerárquica
+
+### Niveles de Abstracción
+```
+NIVEL 0: Estado actual (h(t))
+- Espacio: 10,000D
+- Volatil: cambia constantemente
+- Contenido: Pensamiento "en proceso"
+
+NIVEL 1: Working memory (atractores activos)
+- Capacidad: ~100 atractores
+- Duración: Esta conversación/sesión
+- Contenido: Contexto inmediato, tarea actual
+
+NIVEL 2: Short-term memory
+- Capacidad: ~10,000 atractores
+- Duración: Última hora/día
+- Contenido: Info reciente pero no actual
+
+NIVEL 3: Long-term memory
+- Capacidad: ~1M+ atractores
+- Duración: Permanente (con decay)
+- Contenido: Conocimiento consolidado
+
+NIVEL 4: Procedural memory (pesos de red)
+- Capacidad: Todos los parámetros
+- Duración: Permanente
+- Contenido: Habilidades, patterns generales
+```
+
+### Consolidación de Memoria
+```
+Inspirado en consolidación durante sueño humano:
+
+Proceso periódico (cada N batches):
+
+1. Replay de experiencias:
+   - Samplear atractores de short-term memory
+   - Re-procesar para reforzar conexiones
+   - Similar a "replay" en deep RL
+
+2. Fusión de atractores:
+   - Detectar atractores muy similares
+   - Si dist(A₁, A₂) < threshold:
+     → Fusionar en A_merged
+     → A_merged.center = weighted_average
+     → A_merged.energy = sum(energies)
+
+3. Promoción a long-term:
+   - Atractores con high access_count
+   - O high importance score
+   → Aumentar energy, reducir decay_rate
+
+4. Pruning de irrelevantes:
+   - Atractores con energy < threshold
+   - Y no accedidos recientemente
+   → Eliminar
+```
+
+## 9.2 Compresión Semántica
+
+### Estrategia de Resumen Automático
+```
+Para contexto muy largo (1M+ tokens equivalentes):
+
+No almacenar literal, comprimir semánticamente:
+
+1. Chunking:
+   Dividir en chunks de 512 tokens
+   
+2. Encoding:
+   Cada chunk → h_chunk (10,000D)
+   
+3. Clustering:
+   Agrupar chunks similares
+   
+4. Summarization:
+   - Por cada cluster:
+   - Crear meta-atractor
+   - Meta-atractor.center = mean(h_chunks in cluster)
+   - Meta-atractor.metadata = {
+       summary: "tema principal",
+       chunks: [ids de chunks originales],
+       timestamp_range: [inicio, fin]
+     }
+
+5. Hierarchical storage:
+   - Meta-atractores en memoria
+   - Chunks individuales en cold storage
+   - Recuperar detalles si es necesario
+```
+
+### Recuperación con Degradación Gradual
+```
+Al consultar memoria antigua:
+
+1. Query: "¿Qué hablamos hace 3 meses?"
+
+2. Buscar meta-atractores en rango temporal
+   - Filtrar por timestamp_range
+   - Top-K por relevancia semántica
+
+3. Recuperar summary de meta-atractor
+   - Respuesta: "Discutimos sobre [tema general]"
+   
+4. Si necesita detalles:
+   - Cargar chunks específicos de cold storage
+   - Reconstruir contexto detallado
+   - Puede haber pérdida (chunks purgados)
+
+Degradación:
+- Reciente (< 1 día): perfect recall
+- Medio (1-30 días): summary accuracy ~90%
+- Antiguo (30+ días): solo temas principales, ~70%
+- Muy antiguo (1+ año): conceptos generales, ~50%
+```
+
+## 9.3 Manejo de Contradicciones
+
+### Detección de Conflictos
+```
+Cuando nueva información contradice memoria:
+
+Ejemplo:
+Memoria: "El usuario vive en Madrid"
+Input: "Me mudé a Barcelona"
+
+Detección:
+1. Procesar input → h_new converge a región
+2. Chequear atractores cercanos
+3. Detectar: A_madrid (alta energía) vs h_new (Barcelona)
+4. Medir contradicción: dot(A_madrid, h_new) < threshold
+
+Criterio: Si similarity < -0.3 → posible contradicción
+```
+
+### Resolución de Conflictos
+```
+Estrategia: Temporal versioning
+
+1. No eliminar atractor antiguo inmediatamente
+2. Crear nuevo atractor con timestamp
+3. Marcar antiguo como "deprecated"
+4. Mantener ambos temporalmente
+
+Estructura:
+A_madrid = {
+  center: [...],
+  energy: 0.8,
+  valid_until: timestamp_mudanza,
+  superseded_by: A_barcelona.id
+}
+
+A_barcelona = {
+  center: [...],
+  energy: 1.0,
+  valid_from: timestamp_mudanza,
+  supersedes: A_madrid.id
+}
+
+Al recuperar:
+- Consultas sin temporal context → usar más reciente
+- Consultas con "antes de..." → usar atractor válido en ese tiempo
+```
+
+### Confianza y Incertidumbre
+```
+Asociar nivel de confianza a cada atractor:
+
+Factors que afectan confianza:
+1. Reforzamiento:
+   - Más access_count → mayor confianza
+   - conf = min(1.0, access_count / 100)
+
+2. Fuente:
+   - Usuario explícito: conf = 1.0
+   - Inferido: conf = 0.7
+   - Especulativo: conf = 0.3
+
+3. Consistencia:
+   - Info consistente con otros atractores → aumentar
+   - Info contradictoria → reducir
+
+Al generar respuesta:
+- Si confianza < 0.5:
+   → Incluir "según entiendo..." o "probablemente..."
+- Si confianza > 0.9:
+   → Asertivo
+```
+
+---
+
+# 10. CASOS EDGE Y ROBUSTEZ
+
+## 10.1 Manejo de Divergencia de ODE
+
+### Detección Temprana
+```
+Durante integración, monitorear:
+
+1. Norma del estado:
+   IF ||h(t)|| > norm_threshold (ej: 100):
+      → Posible explosión
+
+2. Velocidad de cambio:
+   IF ||dh/dt|| > velocity_threshold (ej: 1000):
+      → Dinámica inestable
+
+3. Tiempo de integración:
+   IF t > T_max (ej: 50):
+      → No converge
+
+Frecuencia de chequeo: Cada 10 steps de solver
+```
+
+### Estrategias de Recovery
+```
+Opción 1: Early stopping
+- Detener integración
+- Usar último estado estable como h(T)
+- Añadir flag de "incomplete_reasoning"
+
+Opción 2: Reset con regularización
+- Reiniciar desde h(0)
+- Aumentar regularización temporalmente
+- Reducir learning rate de f_θ
+
+Opción 3: Fallback a estado seguro
+- Mantener "safe attractors" conocidos
+- Si diverge, proyectar a safe attractor más cercano
+- Generar respuesta desde ahí
+
+Opción 4: Clip y renormalizar
+- Clipear ||h(t)|| a valor máximo
+- Renormalizar: h ← h / ||h|| · norm_target
+- Continuar integración
+```
+
+### Prevención
+```
+Durante entrenamiento:
+
+1. Añadir pérdida de Lyapunov:
+   L_lyapunov = max(0, λ_max(Jacobian(f_θ)) - 1.0)
+   Penaliza funciones que expanden exponencialmente
+
+2. Spectral normalization:
+   Normalizar pesos de f_θ por su norma espectral
+   Garantiza Lipschitz continuity
+
+3. Adaptive time stepping:
+   Si solver reduce dt muchas veces seguidas
+   → Señal de inestabilidad
+   → Aumentar regularización en siguientes batches
+```
+
+## 10.2 Inputs Adversariales
+
+### Ataques Posibles
+```
+1. Noise injection:
+   Input normal + ruido imperceptible
+   → Puede causar convergencia a región incorrecta
+
+2. Prompt injection:
+   Input diseñado para activar atractores específicos
+   → Manipular respuesta
+
+3. Memory poisoning:
+   Inputs repetidos para crear atractores fuertes maliciosos
+   → Contaminar memoria long-term
+```
+
+### Defensas
+```
+1. Input sanitization:
+   - Detectar anomalías estadísticas en wavelets
+   - Si desviación > 3σ de distribución normal:
+     → Aplicar filtro suavizador
+   - Limitar magnitud de coeficientes
+
+2. Attractor access control:
+   - Rate limiting: máximo N accesos por minuto
+   - Previene creación masiva de atractores maliciosos
+   - Threshold-based: solo crear si importancia > threshold
+
+3. Ensemble verification:
+   - Múltiples forward passes con dropout diferente
+   - Si respuestas divergen mucho → sospechoso
+   - Usar respuesta más conservadora
+
+4. Adversarial training:
+   - Incluir ejemplos adversariales en entrenamiento
+   - Augmentation con ruido adversarial
+   - Enseñar robustez a perturbaciones
+
+5. Confidence thresholding:
+   - No generar respuesta si confianza < threshold
+   - Mejor rechazar que dar respuesta incorrecta
+```
+
+## 10.3 Contexto Vacío o Incompleto
+
+### Sin Atractores Relevantes
+```
+Situación: Query sobre tema completamente nuevo
+
+Ejemplo: "¿Qué opinas de [concepto inexistente en memoria]?"
+
+Comportamiento:
+
+1. Buscar K-nearest attractors
+2. Si min_distance > threshold_unknown (ej: 5.0):
+   → No hay memoria relevante
+
+3. Opciones de respuesta:
+   a) Honesto: "No tengo información sobre eso"
+   b) Generalizar: Usar atractores de nivel superior
+   c) Razonar de primeros principios (sin memoria)
+
+Implementación:
+- Flag: has_relevant_memory = False
+- Desactivar fuerzas de atractores (λ_memory = 0)
+- Basarse solo en dinámica intrínseca f_θ(h)
+```
+
+### Información Ambigua
+```
+Situación: Input puede activar múltiples atractores
+
+Ejemplo: "Banco" → ¿institución financiera o asiento?
+
+Detección:
+- Calcular activación de todos atractores
+- Si top-2 tienen scores similares:
+   similarity_ratio = score₂ / score₁
+   IF similarity_ratio > 0.8:
+      → Ambigüedad detectada
+
+Resolución:
+1. Buscar contexto adicional en conversación
+2. Pedir clarificación al usuario
+3. Generar respuesta que cubra ambas interpretaciones
+4. Usar heurística: la interpretación más común
+```
+
+### Overflow de Contexto
+```
+Situación: Input extremadamente largo (> capacidad)
+
+Ejemplo: Documento de 100k caracteres
+
+Estrategias:
+
+1. Chunking jerárquico:
+   - Dividir en chunks de 512 caracteres
+   - Procesar cada chunk → h_chunk
+   - Agregar: h_total = pooling(h₁, h₂, ..., h_n)
+   
+   Pooling options:
+   a) Mean pooling: h_total = mean(h_chunks)
+   b) Attention pooling: weighted sum
+   c) Hierarchical: procesar chunks en niveles
+
+2. Extractive summarization:
+   - Identificar chunks más importantes
+   - Procesar solo top-K chunks
+   - K determinado por presupuesto computacional
+
+3. Progressive processing:
+   - Procesar secuencialmente
+   - Actualizar atractores incrementalmente
+   - Mantener solo summary en estado
+```
+
+---
+
+# 11. PIPELINE DE DATOS
+
+## 11.1 Formato de Datos de Entrenamiento
+
+### Estructura Base
+```
+Dataset format: JSONL (JSON Lines)
+
+Cada línea es un ejemplo:
+{
+  "id": "unique_identifier",
+  "input": "texto de entrada o pregunta",
+  "target": "texto esperado de salida",
+  "metadata": {
+    "source": "web|book|conversation",
+    "timestamp": "2025-01-15T10:30:00Z",
+    "language": "es|en|...",
+    "difficulty": "easy|medium|hard",
+    "context_length": 1234,
+    "importance": 0.8
+  }
+}
+```
+
+### Tipos de Tareas
+
+**Auto-encoding (fase 1)**
+```
+{
+  "input": "El gato negro saltó sobre el muro",
+  "target": "El gato negro saltó sobre el muro",
+  "metadata": {
+    "task": "autoencoding",
+    "difficulty": "easy"
+  }
+}
+
+Objetivo: Aprender representación continua estable
+```
+
+**Question Answering (fase 2)**
+```
+{
+  "input": "Contexto: El gato es negro. \n Pregunta: ¿De qué color es el gato?",
+  "target": "El gato es negro.",
+  "metadata": {
+    "task": "qa",
+    "requires_memory": true
+  }
+}
+```
+
+**Multi-turn Dialogue (fase 3)**
+```
+{
+  "input": "Usuario: Hola\nAsistente: ¡Hola! ¿Cómo puedo ayudarte?\nUsuario: ¿Qué tiempo hace?",
+  "target": "Necesitaría saber tu ubicación para darte el pronóstico.",
+  "metadata": {
+    "task": "dialogue",
+    "turn": 3,
+    "context_length": 150
+  }
+}
+```
+
+**Reasoning (fase 3)**
+```
+{
+  "input": "Si todos los A son B, y todos los B son C, ¿qué podemos concluir sobre A y C?",
+  "target": "Podemos concluir que todos los A son C, por transitividad.",
+  "metadata": {
+    "task": "reasoning",
+    "difficulty": "medium",
+    "reasoning_type": "deductive"
+  }
+}
+```
+
+## 11.2 Preprocesamiento
+
+### Limpieza de Texto
+```
+Pipeline:
+
+1. Encoding normalization:
+   - Convertir a UTF-8
+   - Normalización Unicode (NFC)
+
+2. Whitespace handling:
+   - Normalizar espacios múltiples → espacio simple
+   - Mantener saltos de línea significativos
+   - Remover trailing/leading whitespace
+
+3. Character filtering:
+   - Remover caracteres de control (excepto \n, \t)
+   - Mantener emojis (son semánticamente relevantes)
+   - Remover caracteres corruptos
+
+4. Length filtering:
+   - Filtrar ejemplos muy cortos (< 10 chars)
+   - Truncar ejemplos muy largos (> 10k chars)
+   - Documentar distribución de longitudes
+```
+
+### Deduplicación
+```
+Problema: Datos duplicados → memorización, no generalización
+
+Estrategia:
+
+1. Exact deduplication:
+   - Hash cada ejemplo (MD5 o SHA-256)
+   - Usar set para detectar duplicados exactos
+   - Remover
+
+2. Near-duplicate detection:
+   - MinHash o SimHash
+   - Detectar textos con >90% similaridad
+   - Mantener solo una instancia
+
+3. Cross-dataset deduplication:
+   - Puede haber overlap entre train/val/test
+   - CRÍTICO: test set debe ser único
+```
+
+### Balanceo de Dataset
+```
+Problema: Desbalance en tipos de tareas o dificultades
+
+Estrategia: Weighted sampling
+
+weights = {
+  "autoencoding": 0.2,
+  "qa": 0.3,
+  "dialogue": 0.3,
+  "reasoning": 0.2
+}
+
+Durante training:
+- Samplear según pesos
+- Asegurar diversidad en cada batch
+- Oversampling de tareas difíciles (opcional)
+```
+
+## 11.3 Data Loading y Streaming
+
+### Arquitectura de DataLoader
+```
+Componentes:
+
+1. Sharding:
+   - Dividir dataset en N shards
+   - Cada worker procesa subset de shards
+   - Evita memoria overflow
+
+2. Buffering:
+   - Pre-cargar M ejemplos en buffer
+   - Mientras procesa batch N, cargar batch N+1
+   - Minimiza I/O bottleneck
+
+3. Shuffling:
+   - Shuffle a nivel de shard
+   - Luego shuffle dentro de buffer
+   - Balance entre randomness y eficiencia
+
+4. Batching dinámico:
+   - Agrupar ejemplos de longitud similar
+   - Minimiza padding
+   - Maximiza utilización de GPU
+```
+
+### Manejo de Longitudes Variables
+```
+Estrategia: Bucketing
+
+Definir buckets:
+bucket_1: [0, 128] chars
+bucket_2: [128, 256] chars
+bucket_3: [256, 512] chars
+...
+
+Para cada batch:
+1. Samplear de un bucket específico
+2. Todos ejemplos tienen longitud similar
+3. Padding mínimo necesario
+
+Padding strategy:
+- Pad a longitud máxima del batch (no del bucket)
+- Usar zeros en wavelet space
+- Añadir attention mask
+```
+
+### Streaming para Datasets Grandes
+```
+Para 10T tokens equivalentes:
+
+No cargar todo en memoria, stream desde disco/red
+
+Implementación:
+
+1. Dataset como iterator:
+   - yield un ejemplo a la vez
+   - No requiere índice completo en RAM
+
+2. Distributed storage:
+   - Almacenar en múltiples nodos
+   - Cada worker lee de su nodo local
+   - Minimiza network I/O
+
+3. Compression:
+   - Almacenar en formato comprimido (gzip, zstd)
+   - Descomprimir on-the-fly
+   - Trade-off: CPU vs I/O
+
+4. Caching inteligente:
+   - Cache ejemplos frecuentemente usados
+   - LRU eviction policy
+   - Típicamente 1-5% del dataset en cache
+```
+
+---
+
+# 12. EVALUACIÓN Y MÉTRICAS
+
+## 12.1 Métricas de Reconstrucción
+
+### Perplexity Adaptado
+```
+Métrica tradicional para LMs: perplexity = exp(cross_entropy)
+
+Para NCFA (continuo):
+
+1. Discretizar output a caracteres
+2. Calcular probabilidad implícita:
+   p(char) ∝ exp(-||pred_char - target_char||²/τ)
+   donde τ = temperatura
+
+3. Perplexity:
+   PPL = exp(-(1/N) Σ log p(char_i))
+
+Interpretación:
+- PPL bajo = reconstrucción precisa
+- Comparable entre modelos NCFA
+- NO directamente comparable con transformer PPL
+```
+
+### Mean Squared Error (MSE)
+```
+En espacio de wavelets:
+
+MSE = (1/N) Σᵢ (ŷᵢ - yᵢ)²
+
+Variantes:
+
+1. Weighted MSE (por nivel):
+   WMSE = Σⱼ wⱼ · MSE_nivel_j
+   donde wⱼ mayor para niveles bajos (más importantes)
+
+2. Perceptual MSE:
+   Calcular MSE en espacio de embedding
+   PMSE = ||φ(ŷ) - φ(y)||²
+   donde φ es encoder pre-entrenado
+
+Targets:
+- Autoencoding: MSE < 0.01
+- Generation: MSE < 0.05
+```
+
+### Character Error Rate (CER)
+```
+Para generación de texto:
+
+CER = (insertions + deletions + substitutions) / total_chars
+
+Cálculo:
+1. Alinear predicted con target (Levenshtein)
+2. Contar errores
+3. Normalizar por longitud
+
+Targets:
+- Short responses: CER < 5%
+- Long generation: CER < 10%
+```
+
+## 12.2 Métricas de Memoria
+
+### Memory Recall Accuracy
+```
+Test: Dar información, luego preguntar
+
+Setup:
+1. Input: "Mi color favorito es azul"
+   → Crear atractor
+2. Después de N ejemplos (N=100, 1000, 10000)
+3. Query: "¿Cuál es mi color favorito?"
+4. Check: ¿Respuesta correcta?
+
+Métrica:
+Recall@N = % de queries respondidas correctamente
+
+Evaluar para diferentes N:
+- N=100: expect ~99%
+- N=1000: expect ~95%
+- N=10000: expect ~80%
+```
+
+### Attractor Quality Metrics
+```
+1. Coverage:
+   # de conceptos únicos con atractor / # total conceptos
+   Target: > 80%
+
+2. Density:
+   Distancia promedio entre atractores
+   Target: ni muy denso (confusión) ni muy disperso
+
+3. Stability:
+   Varianza de posiciones de atractores entre epochs
+   Target: < 0.1 para atractores maduros
+
+4. Activation distribution:
+   ¿Algunos atractores dominan?
+   Measure: Gini coefficient de access_counts
+   Target: < 0.5 (distribución relativamente uniforme)
+```
+
+### Context Window Effective Size
+```
+Test: Incrementar contexto hasta que performance degrada
+
+Procedure:
+1. Crear conversación de longitud L
+2. Hacer pregunta sobre información en posición P
+3. Variar L y P
+4. Medir accuracy
+
+Métrica:
+Effective context = L donde accuracy > 90%
+
+Comparar:
+- NCFA modelo base: expect ~100k tokens
+- Transformer 128k: 128k tokens (pero degradación fuerte al final)
+```
+
+## 12.3 Métricas de Eficiencia
+
+### Latency
+```
+Medir tiempo de respuesta:
+
+Components:
+1. Encoding time: input → wavelets → h(0)
+2. ODE solving time: h(0) → h(T)
+3. Decoding time: h(T) → output
+
+Total latency = sum of components
+
+Targets (modelo base, single query):
+- Encoding: ~5ms
+- ODE (avg 100 steps): ~30ms
+- Decoding: ~5ms
+- Total: ~40ms
+
+Compare with transformer:
+- GPT-4 scale: ~200ms typical
+- Target: 5x faster
+```
+
+### Throughput
+```
+Queries por segundo (QPS):
+
+Single GPU:
+- Batch size 1: ~25 QPS (40ms per query)
+- Batch size 16: ~200 QPS (batching efficiency)
+- Batch size 64: ~500 QPS
+
+Scaling:
+- 8 GPUs: ~4000 QPS
+- 64 GPUs: ~30,000 QPS
+
+Compare with transformer:
+- Similar batch sizes
+- NCFA advantage: O(n) vs O(n²)
+```
+
+### Memory Footprint
+```
+Medir RAM usage:
+
+Components:
+1. Model parameters: ~4GB (1B params, float32)
+2. Activations (batch 16): ~2GB
+3. Attractor storage (1M): ~40GB
+4. KV cache equivalent: ~1GB
+
+Total: ~47GB
+
+Compare with transformer (similar scale):
+- Parameters: ~4GB
+- KV cache (128k context): ~10GB+
+- Total: ~14GB+ (pero degrada con contexto largo)
+
+NCFA trade-off: Más memoria base, pero constante vs contexto
+```
+
+### FLOPs Analysis
+```
+Calcular operaciones de punto flotante:
+
+Forward pass (batch 1):
+1. Encoder: ~5 GFLOPs
+2. ODE (100 steps × f_θ): ~200 GFLOPs
+3. Decoder: ~5 GFLOPs
+Total: ~210 GFLOPs
+
+Compare transformer (similar scale, 512 tokens):
+1. Embeddings: ~0.5 GFLOPs
+2. Attention layers: ~300 GFLOPs (O(n²))
+3. FFN: ~50 GFLOPs
+Total: ~350 GFLOPs
+
+NCFA advantage: ~40% menos FLOPs para contexto medio
+Advantage grows con contexto largo
+```
+
+## 12.4 Métricas de Calidad
+
+### Human Evaluation
+```
+Setup: Human raters evalúan respuestas
+
+Criterios (escala 1-5):
+1. Correctness: ¿Respuesta factualmente correcta?
+2. Relevance: ¿Responde la pregunta?
+3. Coherence: ¿Texto fluido y lógico?
+4. Completeness: ¿Información suficiente?
+
+Procedure:
+1. Sample 1000 queries (diverse)
+2. Generar respuestas con NCFA
+3. 3 raters independientes evalúan
+4. Promediar scores
+5. Inter-rater agreement (Krippendorff's α > 0.7)
+
+Target scores:
+- Correctness: > 4.0
+- Relevance: > 4.2
+- Coherence: > 4.3
+- Completeness: > 3.8
+```
+
+### Benchmark Tasks
+```
+Evaluar en benchmarks estándar:
+
+1. GLUE/SuperGLUE:
+   - Classification tasks
+   - Adaptar: usar h(T) como feature vector
+   - Linear probe on top
+
+2. SQuAD (Reading Comprehension):
+   - Exact match: % respuestas exactas
+   - F1 score: overlap con respuesta correcta
+
+3. GSM8K (Math reasoning):
+   - Accuracy: % problemas resueltos correctamente
+
+4. TruthfulQA:
+   - Truthfulness: evitar falsedades
+   - Informativeness: dar info útil
+
+5. LongBench:
+   - Específicamente para contexto largo
+   - Tasks con 10k-100k tokens de contexto
+
+Targets (comparable con SOTA):
+- GLUE: > 85%
+- SQuAD F1: > 88%
+- GSM8K: > 60%
+- TruthfulQA: > 50%
+```
+
+### Consistency Tests
+```
+Evaluar coherencia interna:
+
+Test 1: Repeat question
+- Preguntar lo mismo dos veces
+- ¿Respuestas consistentes?
+- Measure: cosine similarity > 0.9
+
+Test 2: Paraphrase
+- Preguntar lo mismo con palabras diferentes
+- ¿Respuestas similares semánticamente?
+- Measure: semantic similarity > 0.85
+
+Test 3: Contradiction detection
+- Dar info A, luego info contradictoria B
+- ¿Sistema detecta contradicción?
+- Measure: detection rate > 80%
+
+Test 4: Temporal consistency
+- Dar info secuencialmente
+- ¿Mantiene coherencia temporal?
+- Example: "Hoy es lunes" ... "¿Qué día es mañana?"
+```
+
+---
+
+# 13. CONFIGURACIONES DE MODELOS
+
+## 13.1 Modelo Tiny (Proof-of-Concept)
+
+### Especificaciones
+```
+Parámetros totales: 100M
+
+Arquitectura:
+- Espacio de fase: D = 2,000
+- Coeficientes wavelet: 256
+- Encoder: 3 capas, [256 → 1024 → 2000]
+- ODE function: 2 capas, [2000 → 3000 → 2000]
+- Decoder: 3 capas, [2000 → 1024 → 256]
+- Atractores: 10k
+
+ODE config:
+- T_max: 5.0
+- Pasos típicos: ~50
+- Solver: dopri5
+
+Training:
+- Batch size: 64
+- Learning rate: 5e-4
+- GPUs: 1-2
+- Tiempo: ~1 semana
+
+Uso:
+- Validación de concepto
+- Debugging
+- Experimentos rápidos
+```
+
+### Limitaciones
+```
+- Contexto efectivo: ~1k tokens
+- Capacidad de razonamiento: limitada
+- Recall accuracy: ~70% @ 1k ejemplos
+- Tareas: autoencoding, QA simple
+
+No apto para producción, solo research
+```
+
+## 13.2 Modelo Base (1B parámetros)
+
+### Especificaciones Completas
+```
+Parámetros totales: 1B
+
+ENCODER:
+- Input: 2048 coefs wavelet
+- Arquitectura:
+  * Linear(2048 → 4096) + LayerNorm + GELU
+  * Linear(4096 → 6144) + LayerNorm + GELU + Dropout(0.1)
+  * Linear(6144 → 8192) + LayerNorm + GELU + Dropout(0.1)
+  * Linear(8192 → 10000) + LayerNorm
+- Params: ~150M
+
+ODE FUNCTION:
+- Input: [h(10000); c(10000); t(1)] → 20001
+- Arquitectura híbrida:
+  * Local attention (radius=50): 10000 → 10000
+  * MLP: Linear(20001 → 15000) + LayerNorm + Tanh
+  * MLP: Linear(15000 → 12000) + LayerNorm + Tanh + Dropout(0.05)
+  * Linear(12000 → 10000)
+  * Residual connections
+- Params: ~500M
+
+ATTRACTOR SYSTEM:
+- Espacio de fase: 10,000D
+- Cantidad: 1M atractores
+- Storage: ~40GB (float32)
+- Indexing: Ball tree para K-NN
+
+DECODER:
+- Input: 10000
+- Arquitectura (simétrica a encoder):
+  * Linear(10000 → 8192) + LayerNorm + GELU
+  * Linear(8192 → 6144) + LayerNorm + GELU + Dropout(0.1)
+  * Linear(6144 → 4096) + LayerNorm + GELU + Dropout(0.1)
+  * Linear(4096 → 2048)
+- Params: ~150M
+
+WAVELETS:
+- Familia: Daubechies db8
+- Niveles: 5
+- Input size: 512 chars (upsampled a 2048)
+- Output size: 2048 coefs
+
+ODE CONFIG:
+- T_max: 10.0
+- Pasos adaptativos: ~100 promedio
+- rtol: 1e-3
+- atol: 1e-4
+- Solver: dopri5
+
+Total params breakdown:
+- Encoder: 150M
+- ODE func: 500M
+- Decoder: 150M
+- Embedding auxiliar: 50M
+- Otros: 150M
+TOTAL: ~1B
+```
+
+### Recursos de Entrenamiento
+```
+Hardware:
+- 64 GPUs H100 (80GB cada una)
+- 256 CPU cores
+- 2TB RAM
+- 50TB SSD storage
+
+Tiempo:
+- Fase 1 (dinámica básica): 1 semana
+- Fase 2 (memoria): 3 semanas
+- Fase 3 (razonamiento): 8 semanas
+- Total: ~3 meses
+
+Dataset:
+- 1T tokens equivalentes
+- ~500GB texto crudo
+- Diverso: web, libros, diálogos
+
+Costo estimado:
+- Compute: ~$2M (H100 @ ~$3/GPU-hour)
+- Storage: ~$50k
+- Personal: variable
+- Total: ~$2-3M USD
+```
+
+### Performance Esperado
+```
+Latency:
+- Single query: ~40ms (P50), ~80ms (P99)
+- Batch 16: ~60ms
+
+Throughput:
+- Single GPU: ~200 QPS (batch 16)
+- 8 GPUs: ~1500 QPS
+
+Quality:
+- Perplexity equivalent: ~15-20
+- GLUE: ~85%
+- SQuAD F1: ~87%
+- Memory recall @ 10k: ~85%
+
+Context:
+- Effective window: ~100k tokens
+- No degradación significativa hasta 50k
+```
+
+## 13.3 Modelo Grande (100B parámetros)
+
+### Especificaciones
+```
+Parámetros totales: 100B
+
+Scaling factors vs modelo base:
+- Espacio de fase: 10k → 50k (5x)
+- ODE function: más profundo, 16 capas
+- Atractores: 1M → 100M (100x)
+- Encoder/Decoder: más anchos
+
+Arquitectura:
+- Similar estructura pero escalada
+- Bottleneck attention en ODE
+- Mixture of Experts (MoE) opcional
+
+ODE config:
+- T_max: 20.0 (más tiempo de razonamiento)
+- Pasos adaptativos: ~500 promedio
+
+Storage:
+- Parameters: ~400GB (float32)
+- Atractores: ~2TB
+- Total: ~2.5TB
+
+Requiere:
+- Model parallelism (no cabe en 1 GPU)
+- Pipeline + tensor parallelism
+- 256-512 GPUs para training
+```
+
+### Recursos de Entrenamiento
+```
+Hardware:
+- 10,000 GPUs H100
+- 3 meses de entrenamiento
+- Costo: ~$50M USD
+
+Dataset:
+- 10T tokens equivalentes
+- Todo lo público disponible
+- Cuidadosa deduplicación
+
+Performance esperado:
+- Latency: ~200ms (más complejo)
+- Quality: State-of-the-art
+- Context: ~10M tokens efectivos
+```
+
+## 13.4 Configuraciones Especializadas
+
+### NCFA-Fast (Inferencia optimizada)
+```
+Base: Modelo Base 1B
+Modificaciones:
+- INT8 quantization
+- Reduced ODE steps (50 vs 100)
+- Pruned attractors (top 100k activos)
+- Distilled from modelo grande
+
+Trade-offs:
+- 3x más rápido
+- -5% quality
+- 1/4 de memoria
+```
+
+### NCFA-Long (Contexto extendido)
+```
+Base: Modelo Base 1B
+Modificaciones:
+- 10M atractores (vs 1M)
+- Hierarchical memory system
+- Consolidation cada 1k steps
+
+Especialidad:
+- Context window: 1M+ tokens
+- Conversaciones multi-sesión
+- Memory decay muy lento
+```
+
+### NCFA-MultiModal
+```
+Extensión para imagen + texto + audio
+
+Añadir:
+- Encoders específicos por modalidad
+- Shared espacio de fase (10k D)
+- Atractores multimodales
+
+Example:
+- Imagen de gato → región A en espacio de fase
+- Palabra "gato" → misma región A
+- Audio "miau" → misma región A
+
+Cross-modal reasoning natural
+```
+
+---
+
+# 14. IMPLEMENTACIÓN POR FASES
+
+## 14.1 Fase 0: Setup y Preparación (Semanas 1-2)
+
+### Infraestructura
+```
+Tareas:
+1. Setup cluster de GPUs
+   - Configurar red de alta velocidad
+   - Instalar drivers, CUDA, PyTorch
+   - Configurar distributed training
+
+2. Preparar storage
+   - Montar shared filesystem
+   - Setup pipeline de datos
+   - Implementar sharding
+
+3. Tooling
+   - Logging (Weights & Biases / TensorBoard)
+   - Checkpointing automático
+   - Monitoring de GPUs
+
+4. Código base
+   - Estructura de repositorio
+   - Tests unitarios para componentes
+   - CI/CD pipeline
+```
+
+### Validación de Componentes
+```
+Implementar y testear individualmente:
+
+1. Wavelet transform:
+   - Test: input → wavelets → inverse → output
+   - Verify: MSE < 1e-6
+
+2. Embedding network:
+   - Test: forward pass con inputs sintéticos
+   - Verify: output shape correcto
+
+3. ODE solver:
+   - Test: con función simple (ej: dh/dt = -h)
+   - Verify: converge a solución analítica
+
+4. Attractor system:
+   - Test: create, update, retrieve
+   - Verify: K-NN correctos
+
+Integration test: Pipeline completo con modelo tiny
+```
+
+## 14.2 Fase 1: Proof-of-Concept (Semanas 3-6)
+
+### Objetivos
+```
+1. Validar que el sistema funciona end-to-end
+2. Identificar problemas técnicos tempranos
+3. Tune hiperparámetros básicos
+```
+
+### Modelo y Dataset
+```
+Modelo: Tiny (100M params)
+Dataset: Subset pequeño (~1GB)
+- Solo autoencoding
+- Textos cortos (<100 chars)
+
+Entrenamiento:
+- 1-2 GPUs
+- 1 semana máximo
+- Rápido iteration
+```
+
+### Métricas de Éxito
+```
+1. Training converge: loss disminuye consistentemente
+2. Reconstruction: MSE < 0.05
+3. ODE stability: <1% divergencia
+4. No memory leaks: RAM estable
+
+Si falla: Debug, fix, reintent
+```
+
+## 14.3 Fase 2: Modelo Base Inicial (Semanas 7-18)
+
+### Sub-fase 2.1: Dinámica Básica (Semanas 7-10)
+```
+Objetivo: Sistema fluye establemente sin memoria
+
+Training config:
+- Modelo Base (1B)
+- λ₄ (attractor loss) = 0 (sin memoria)
+- Tareas: autoencoding + simple QA
+- Dataset: 100GB
+
+Métricas objetivo:
+- Reconstruction MSE < 0.01
+- ODE convergence > 95%
+- Perplexity equiv < 25
+
+Deliverable: Modelo que reconstructs bien
+```
+
+### Sub-fase 2.2: Introducir Memoria (Semanas 11-14)
+```
+Objetivo: Atractores funcionales, recuperación básica
+
+Training config:
+- Partir de checkpoint fase 2.1
+- Activar λ₄ progresivamente: 0 → 0.2
+- Tareas: Q&A con contexto
+- Dataset: 300GB
+
+Nuevos componentes:
+- Attractor creation logic
+- Consolidation process
+
+Métricas objetivo:
+- Memory recall @ 1k: > 80%
+- Attractor coverage: > 70%
+- Context window: ~10k tokens
+
+Deliverable: Sistema con memoria funcional
+```
+
+### Sub-fase 2.3: Scaling y Optimización (Semanas 15-18)
+```
+Objetivo: Full dataset, fine-tuning
+
+Training config:
+- Full 1T tokens
+- Todas las losses activas
+- Tareas diversas
+- Checkpointing frecuente
+
+Optimizaciones:
+- Tune learning rate schedule
+- Ajustar balances de pérdidas
+- Pruning de atractores redundantes
+
+Métricas objetivo:
+- Benchmarks: cerca de SOTA
+- Latency: < 50ms P50
+- Memory recall @ 10k: > 85%
+
+Deliverable: Modelo Base production-ready
+```
+
+## 14.4 Fase 3: Escalamiento (Semanas 19-30)
+
+### Objetivos
+```
+1. Escalar a modelo grande (100B)
+2. Advanced features (multimodal, etc.)
+3. Optimizaciones de inferencia
+```
+
+### Parallelization Setup
+```
+1. Implementar model parallelism:
+   - Pipeline parallelism: dividir capas entre GPUs
+   - Tensor parallelism: dividir matrices grandes
+   - Test con modelo mediano (10B) primero
+
+2. Data parallelism:
+   - Distribuir batches entre nodos
+   - Gradient synchronization optimizada
+   - ZeRO optimizer (stage 2 o 3)
+
+3. Attractor distribution:
+   - Particionar atractores entre GPUs
+   - Consistent hashing para lookups
+   - Replicar atractores más accedidos
+```
+
+### Training del Modelo Grande
+```
+Recursos:
+- 1000-10000 GPUs H100
+- 3 meses de training continuo
+- Monitoreo 24/7
+
+Dataset:
+- 10T tokens equivalentes
+- Proceso de filtrado riguroso
+- Balance de dominios
+
+Challenges esperados:
+- Fallos de hardware → checkpointing robusto
+- Inestabilidad numérica → monitoring constante
+- Gradient explosion → adaptive clipping
+
+Milestones:
+- Semana 4: Convergencia inicial
+- Semana 8: Mid-point evaluation
+- Semana 12: Final training, fine-tuning
+```
+
+### Desarrollo de Features Avanzadas
+```
+En paralelo al training grande:
+
+1. Multimodalidad:
+   - Encoders para imagen (CNN/ViT-based)
+   - Encoders para audio (spectrograms)
+   - Fusión en espacio de fase compartido
+
+2. Chain-of-thought:
+   - Aumentar T_max para problemas complejos
+   - Visualizar trayectoria de razonamiento
+   - Intermediate checkpoints interpretables
+
+3. Tool use:
+   - Atractores especiales para API calls
+   - Estado h(t) mapea a función + argumentos
+   - Ejecutar y continuar ODE con resultado
+
+4. Safety features:
+   - Detectores de contenido dañino
+   - Atractores de "refusal"
+   - Confidence thresholding
+```
+
+## 14.5 Fase 4: Optimización y Deployment (Semanas 31-40)
+
+### Optimización de Inferencia
+```
+Tareas:
+
+1. Quantization:
+   - Post-training INT8 quantization
+   - Calibrar con dataset representativo
+   - Validar pérdida de calidad < 2%
+
+2. Pruning:
+   - Identificar atractores poco usados
+   - Comprimir o archivar
+   - Mantener solo top 1M activos en GPU
+
+3. Distillation:
+   - Entrenar NCFA-Fast (300M) destilado de Base (1B)
+   - Knowledge distillation loss
+   - Target: 90% calidad, 5x velocidad
+
+4. Compilation:
+   - TorchScript / ONNX para deployment
+   - Fuse operaciones donde posible
+   - Optimizar para hardware específico
+```
+
+### Sistema de Inferencia
+```
+Arquitectura de serving:
+
+1. Load balancer:
+   - Rutear queries según complejidad
+   - Simple queries → NCFA-Fast
+   - Complex queries → NCFA-Base/Grande
+
+2. Batching dinámico:
+   - Agrupar queries por longitud
+   - Timeout adaptativo (10-50ms)
+   - Maximizar throughput
+
+3. Caching:
+   - Cache de embeddings para prefijos comunes
+   - Cache de atractores hot
+   - Cache de respuestas frecuentes
+
+4. Monitoring:
+   - Latencia P50, P95, P99
+   - Error rates
+   - GPU utilization
+   - Attractor access patterns
+```
+
+### Testing y Validación
+```
+Pre-deployment:
+
+1. Unit tests:
+   - Cada componente individualmente
+   - Coverage > 80%
+
+2. Integration tests:
+   - Pipeline completo
+   - Múltiples escenarios
+
+3. Performance tests:
+   - Load testing (1k, 10k, 100k QPS)
+   - Stress testing (picos de tráfico)
+   - Endurance testing (24h continuo)
+
+4. Quality tests:
+   - Benchmark suite completo
+   - Human evaluation (1000 ejemplos)
+   - A/B test vs baseline
+
+5. Safety tests:
+   - Adversarial inputs
+   - Edge cases
+   - Toxicity detection
+```
+
+### Deployment Gradual
+```
+Estrategia de rollout:
+
+Semana 1: Internal alpha
+- Solo equipo interno
+- 100 QPS máximo
+- Feedback rápido
+
+Semana 2-3: Closed beta
+- Usuarios seleccionados
+- 1k QPS
+- Monitoreo intensivo
+
+Semana 4-5: Open beta
+- Público general con opt-in
+- 10k QPS
+- Recolectar feedback
+
+Semana 6+: Production gradual
+- 1% tráfico
+- 5% tráfico (si métricas OK)
+- 25% tráfico
+- 100% tráfico (si todo bien)
+
+Rollback plan:
+- Revertir a sistema anterior en <5 min
+- Fallback automático si error rate > threshold
+```
+
+
+# 15. APÉNDICES
+
+## 15.1 Glosario de Términos
+
+```
+Atractor: Punto o región estable en espacio de fase hacia el cual 
+convergen trayectorias cercanas. Representa conceptos en memoria.
+
+Espacio de fase: Espacio de alta dimensión (10,000D) donde cada 
+punto representa un estado posible del sistema.
+
+Neural ODE: Ecuación diferencial ordinaria donde la función que 
+define la dinámica es una red neural.
+
+Wavelet: Función oscilatoria localizada usada para descomponer 
+señales en múltiples escalas.
+
+Cuenca de atracción: Región del espacio de fase desde la cual 
+trayectorias convergen a un atractor específico.
+
+Consolidación: Proceso de fortalecer y reorganizar memoria, 
+inspirado en consolidación durante sueño.
+
+Degradación gradual: Pérdida progresiva de precisión de memoria 
+con el tiempo, similar a memoria humana.
+
+Trayectoria: Secuencia de estados h(t) que el sistema recorre 
+durante integración de ODE.
+
+Resonancia: Activación de atractor cuando estado actual es 
+semánticamente similar.
+```
+
+## 15.2 Referencias Técnicas Clave
+
+### Papers Fundamentales
+```
+1. Neural Ordinary Differential Equations
+   Chen et al., NeurIPS 2018
+   - Base teórica para Neural ODEs
+
+2. Augmented Neural ODEs
+   Dupont et al., NeurIPS 2019
+   - Expansión del espacio de fase
+
+3. Neural Memory Modules
+   Hopfield, PNAS 1982
+   - Redes de atractores para memoria
+
+4. Continuous Normalizing Flows
+   Grathwohl et al., ICLR 2019
+   - Transformaciones continuas
+
+5. Wavelet Transform for Deep Learning
+   Bruna & Mallat, IEEE 2013
+   - Wavelets en ML
+```
+
+### Librerías y Herramientas
+```
+1. PyTorch: Framework principal
+   - pytorch.org
+   - Version: 2.0+
+
+2. torchdiffeq: Neural ODE solver
+   - github.com/rtqichen/torchdiffeq
+   - Implementa dopri5, adjoint method
+
+3. PyWavelets: Wavelet transforms
+   - pywavelets.readthedocs.io
+   - Todas las familias de wavelets
+
+4. FAISS: Vector search
+   - github.com/facebookresearch/faiss
+   - Para búsqueda de K-NN en atractores
+
+5. Weights & Biases: Experiment tracking
+   - wandb.ai
+   - Logging y visualización
+```
+
+## 15.3 Comparación con Arquitecturas Existentes
+
+### NCFA vs Transformers
+
+| Aspecto | Transformers | NCFA |
+|---------|--------------|------|
+| **Representación** | Tokens discretos | Ondas continuas |
+| **Procesamiento** | Atención O(n²) | ODE O(n) |
+| **Memoria** | KV cache fijo | Atractores adaptativos |
+| **Contexto** | Limitado (128k-1M) | Prácticamente ilimitado |
+| **Latencia** | Crece con contexto | Constante |
+| **Interpretabilidad** | Attention maps | Trayectorias visualizables |
+| **Multimodal** | Requiere adaptación | Nativo |
+
+### NCFA vs RNNs/LSTMs
+
+| Aspecto | RNN/LSTM | NCFA |
+|---------|----------|------|
+| **Gradientes** | Vanishing/exploding | Adjoint method estable |
+| **Paralelización** | Secuencial | Paralelo en tiempo |
+| **Memoria** | Hidden state limitado | Atractores explícitos |
+| **Flexibilidad** | Paso fijo | Paso adaptativo |
+| **Capacidad** | Limitada | Alta (1B-100B params) |
+
+### NCFA vs State Space Models (Mamba, etc.)
+
+| Aspecto | SSMs | NCFA |
+|---------|------|------|
+| **Base teórica** | Sistemas lineales | ODEs no lineales |
+| **Expresividad** | Media | Alta |
+| **Memoria** | Implícita en estado | Explícita en atractores |
+| **Eficiencia** | O(n) excelente | O(n) buena |
+| **Madurez** | Reciente | Experimental |
+
+## 15.4 Preguntas Frecuentes (FAQ)
+
+### Q1: ¿Por qué wavelets y no otros métodos?
+```
+A: Wavelets capturan información en múltiples escalas simultáneamente,
+esencial para lenguaje (letras, palabras, frases, párrafos).
+Alternativas como Fourier solo capturan frecuencias globales.
+```
+
+### Q2: ¿Los atractores no son solo embeddings?
+```
+A: No. Embeddings son estáticos. Atractores:
+- Tienen dinámica (atraen estados)
+- Se actualizan con uso
+- Tienen decay temporal
+- Forman jerarquías emergentes
+Son memoria activa, no solo lookup table.
+```
+
+### Q3: ¿Qué pasa si el ODE no converge?
+```
+A: Múltiples safeguards:
+1. Timeout (T_max)
+2. Early stopping si ||dh/dt|| pequeño
+3. Fallback a último estado estable
+4. Fallback a atractor seguro predefinido
+Diseñado para degradar gracefully.
+```
+
+### Q4: ¿Cómo se compara la velocidad con GPT-4?
+```
+A: Para contexto < 10k tokens: similar
+Para contexto > 50k tokens: 5-10x más rápido (O(n) vs O(n²))
+Pero: latencia base ligeramente mayor por ODE solving.
+Trade-off favorable para contexto largo.
+```
+
+### Q5: ¿Es posible fine-tuning?
+```
+A: Sí, múltiples maneras:
+1. Fine-tune pesos de redes (encoder, ODE, decoder)
+2. Añadir atractores específicos de dominio
+3. Ajustar decay rates para retener info crítica
+4. PEFT methods (LoRA adaptado a ODEs)
+```
+
+### Q6: ¿Cuánta memoria necesito para entrenar?
+```
+A: Modelo Base (1B):
+- Mínimo: 8x GPU 40GB (A100)
+- Recomendado: 64x GPU 80GB (H100)
+- Con gradient checkpointing: puede reducir 3x
+
+Modelo Grande (100B):
+- Mínimo: 256x GPU 80GB
+- Óptimo: 1000+ GPUs
+Requiere model parallelism obligatoriamente.
+```
+
+### Q7: ¿Puede manejar múltiples idiomas?
+```
+A: Sí, naturalmente. Wavelets son agnostic a idioma.
+Bytes son universales. Espacio de fase es compartido.
+"Cat", "Gato", "猫" convergen a regiones cercanas si
+entrenado multilingually.
+```
+
+### Q8: ¿Qué pasa con información sensible?
+```
+A: Opciones:
+1. Marcar atractores sensibles con flag especial
+2. Implementar "right to forget": eliminar atractores
+3. Encryption de atractores en storage
+4. Partición de atractores por usuario
+Más research needed en privacy.
+```
+
+### Q9: ¿Se puede visualizar el razonamiento?
+```
+A: Sí, ventaja sobre transformers:
+- Plotear trayectoria h(t) en espacio de fase (reducido a 2D/3D)
+- Ver qué atractores activa
+- Visualizar como "pensamiento en movimiento"
+- Identificar donde se "atascó" si falla
+Excelente para debugging e interpretabilidad.
+```
+
+### Q10: ¿Roadmap de desarrollo realista?
+```
+A: Con recursos adecuados:
+- Año 1: Proof-of-concept + modelo base
+- Año 2: Modelo grande + optimizaciones
+- Año 3: Production + features avanzadas
+
+Sin recursos de BigTech:
+- Año 1-2: POC y modelo pequeño
+- Año 3-4: Fundraising + scaling
+- Año 5+: Competir con SOTA
+
+Es ambicioso pero factible con ~$50M+ funding.
+```
+
+# 16. CONCLUSIÓN Y PRÓXIMOS PASOS
+
+## 16.1 Resumen de Innovaciones Clave
+
+```
+1. REPRESENTACIÓN CONTINUA
+   - Elimina discretización artificial de tokens
+   - Wavelets capturan multi-escala
+   - Más cercano a procesamiento neural biológico
+
+2. DINÁMICA DE FLUJO
+   - Neural ODEs en vez de capas discretas
+   - Profundidad adaptativa (piensa más si necesita)
+   - O(n) complexity vs O(n²) de atención
+
+3. MEMORIA EXPLÍCITA
+   - Atractores como memoria asociativa
+   - Capacidad teóricamente ilimitada
+   - Degradación gradual natural
+
+4. CONTEXTO EXTENDIDO
+   - No limitado por ventana fija
+   - Memoria de tamaño constante
+   - Escalamiento sublineal
+
+5. INTERPRETABILIDAD
+   - Trayectorias visualizables
+   - Atractores inspeccionables
+   - Proceso de "pensamiento" observable
+```
+
+## 16.2 Desafíos Pendientes
+
+### Técnicos
+```
+1. Estabilidad numérica a largo plazo
+   - ODE puede ser inestable para T muy grande
+   - Necesita más research en arquitecturas robustas
+
+2. Scaling eficiente de atractores
+   - Gestionar 100M+ atractores es no-trivial
+   - Algorithms de indexing mejores
+
+3. Training efficiency
+   - Backprop a través de ODE es costoso
+   - Mejores métodos de optimización
+
+4. Benchmark adaptado
+   - Métricas actuales diseñadas para transformers
+   - Crear benchmarks que valoren contexto largo
+```
+
+### De Investigación
+```
+1. Teoría formal
+   - Proofs de convergencia
+   - Análisis de capacidad
+   - Guarantees de memoria
+
+2. Interpretabilidad profunda
+   - Qué representan exactamente los atractores
+   - Cómo emerge el razonamiento
+   - Transferencia de conocimiento
+
+3. Comparación justa
+   - Metodología para comparar con transformers
+   - Control de compute budgets
+   - Evaluación de trade-offs
+```
+
+### Prácticos
+```
+1. Infraestructura
+   - Herramientas de desarrollo maduras
+   - Debugging tools específicos
+   - Monitoring customizado
+
+2. Ecosistema
+   - Librerías de alto nivel
+   - Pre-trained models
+   - Community adoption
+
+3. Casos de uso
+   - Identificar aplicaciones killer
+   - Donde NCFA es claramente superior
+   - Product-market fit
+```
+
+## 16.3 Roadmap Inmediato (Próximos 6 meses)
+
+### Mes 1-2: Setup
+```
+- Montar infraestructura básica
+- Implementar componentes core
+- Validar individualmente
+- Integration testing
+```
+
+### Mes 3-4: Proof-of-Concept
+```
+- Entrenar modelo Tiny (100M)
+- Validar que funciona end-to-end
+- Iterar rápido en hiperparámetros
+- Identificar y fix issues
+```
+
+### Mes 5-6: Scaling Inicial
+```
+- Entrenar modelo Base (1B) - fase 1
+- Solo autoencoding y QA simple
+- Establecer baseline de performance
+- Preparar para siguiente fase
+```
+
+## 16.4 Visión a Largo Plazo
+
+```
+NCFA como paradigma de IA:
+
+1. Más cercano a cognición biológica
+   - Procesamiento continuo
+   - Memoria asociativa
+   - Razonamiento emergente
+
+2. Escalable a problemas complejos
+   - Conversaciones multi-sesión
+   - Razonamiento temporal sofisticado
+   - Integración multimodal natural
+
+3. Interpretable y controlable
+   - Entender cómo "piensa"
+   - Modificar memoria explícitamente
+   - Safety by design
+
+4. Eficiente en recursos
+   - Menos compute para contexto largo
+   - Mejor uso de memoria
+   - Hardware neuromórfico futuro
+
+Si exitoso, NCFA podría:
+- Reemplazar transformers en ciertos dominios
+- Abrir nuevas aplicaciones (memoria autobiográfica, etc.)
+- Inspirar siguientes generaciones de arquitecturas
+```
+
+## 16.5 Cómo Contribuir
+
+```
+Este es un proyecto ambicioso que requiere:
+
+1. INVESTIGADORES
+   - Teoría de sistemas dinámicos
+   - Neurociencia computacional
+   - Optimización de ODEs
+
+2. INGENIEROS
+   - Implementación eficiente
+   - Distributed systems
+   - GPU optimization
+
+3. ML PRACTITIONERS
+   - Experimentación
+   - Tuning de hiperparámetros
+   - Benchmark evaluation
+
+4. FUNDING
+   - $2-5M para POC + modelo base
+   - $50M+ para competir con SOTA
+   - Grants, VCs, o BigTech partnership
+```
+
+
+
+# CHANGELOG
+
+```
+v1.0 (2025-10-13):
+- Especificación técnica completa inicial
+- Todas las secciones desde arquitectura hasta deployment
+- Configuraciones de modelos detalladas
+- Pipeline de implementación por fases
+
+Future versions:
+- Actualizar con resultados experimentales
+- Refinar hiperparámetros basado en evidencia
+- Expandir secciones según feedback
+- Añadir apéndices con código de ejemplo
+```
+
+
+**Documento generado por: Joaquín Stürtz**  
+**Fecha: 13 de Octubre, 2025**  
+**Versión: 1.0**  
+**Estado: Especificación Técnica Completa**  
+
+Este documento contiene toda la información técnica necesaria para implementar Neural Continuous Flow Architecture (NCFA) desde cero. Es un living document que debe actualizarse con descubrimientos experimentales y refinamientos durante la implementación real.
