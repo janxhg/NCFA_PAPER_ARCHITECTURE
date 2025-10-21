@@ -1,134 +1,138 @@
 # 🧠 NCFA — *Neural Continuous Flow Architecture*
 
-### *Más allá de los tokens y la atención transformer*
+### *Beyond Tokens and Transformer Attention*
 
 
 
-## 📋 Resumen Ejecutivo
+## 📋 Executive Summary
 
-**NCFA** es una nueva arquitectura de inteligencia artificial que **elimina completamente la tokenización** y reemplaza la atención cuadrática de los transformers por un **flujo dinámico continuo** con **atractores geométricos**.
+**NCFA** is a novel artificial intelligence architecture that **completely eliminates tokenization** and replaces the quadratic attention mechanism of transformers with a **continuous dynamic flow** governed by **geometric attractors**.
 
-En lugar de procesar texto como secuencias de tokens, **NCFA representa la información como ondas continuas** en un espacio de fase de alta dimensión.
-Los **conceptos** emergen naturalmente como **atractores estables** en ese espacio.
-
-
-
-## 🎯 Problema que Resuelve
-
-### 🔹 Limitaciones de los Transformers
-
-* **Tokenización artificial:**
-  Rompe palabras en fragmentos arbitrarios → vocabularios gigantes (50k–100k tokens).
-  Ejemplo: `"run"` ≠ `"running"` aunque estén semánticamente relacionados.
-* **Atención cuadrática (O(n²)):**
-  Costosa y poco escalable en contextos largos.
-* **Contexto limitado:**
-  Ventanas fijas (2k–128k tokens). La memoria se pierde al superar el límite.
-* **Memoria implícita:**
-  Solo a través de pesos y KV-cache, sin memoria explícita a largo plazo.
+Instead of processing text as discrete token sequences, **NCFA represents information as continuous waves** flowing through a high-dimensional phase space, where **concepts naturally emerge as stable attractors**.
 
 
 
-## 🏗️ Arquitectura General
+## 🎯 The Problem It Solves
 
-### 🔹 1. Wavelet Encoder — *Entrada Continua*
+### 🔹 Limitations of Transformers
 
-Convierte texto a una **señal continua** mediante transformadas wavelet.
+* **Artificial tokenization:**
+  Splits words into arbitrary fragments → huge vocabularies (50k–100k tokens).
+  Example: `"run"` ≠ `"running"`, despite sharing semantic meaning.
+
+* **Quadratic attention (O(n²)):**
+  Expensive and poorly scalable for long contexts.
+
+* **Limited context:**
+  Fixed attention windows (2k–128k tokens). Memory fades beyond the limit.
+
+* **Implicit memory:**
+  Stored only in weights and KV-cache, with no explicit long-term memory.
+
+
+
+## 🏗️ General Architecture
+
+### 🔹 1. Wavelet Encoder — *Continuous Input*
+
+Converts text into a **continuous signal** using wavelet transforms.
 
 **Pipeline:**
 
-1. Texto → bytes UTF-8 → normalización (0–1)
-2. Interpolación spline → señal continua
-3. Transformada wavelet (Daubechies nivel 8, 5 niveles)
-4. Resultado: `2048 coeficientes` que capturan letras, palabras, frases y contexto global.
+1. Text → UTF-8 bytes → normalized (0–1)
+2. Cubic spline interpolation → continuous signal
+3. Daubechies level-8 wavelet transform (5 decomposition levels)
+4. Output: `2048 coefficients` capturing letters, words, phrases, and global context
 
-**Ventaja:**
-No hay vocabulario. "gato" y "gatos" comparten estructura similar de forma natural.
+**Advantage:**
+No fixed vocabulary. “cat” and “cats” naturally produce similar wavelet structures.
 
 
 
-### 🔹 2. Embedding Network — *Proyección al Espacio de Fase*
+### 🔹 2. Embedding Network — *Projection into Phase Space*
 
-Proyecta los 2048 coeficientes a un **espacio de 10,000 dimensiones**.
+Projects the 2048 wavelet coefficients into a **10,000-dimensional phase space**.
 
 ```text
 2048 → 4000 → 6000 → 8000 → 10000
 ```
 
-* **Arquitectura:** MLP profundo con `LayerNorm`, `GELU`, `Dropout 0.1`
-* **Sin atención:** Solo transformaciones lineales + normalización
-* **Por qué 10k dims:** Espacio suficiente para separar millones de conceptos
+* **Architecture:** Deep MLP with `LayerNorm`, `GELU`, `Dropout 0.1`
+* **No attention:** Pure linear transformations + normalization
+* **Why 10k dimensions:** Enough room for millions of distinct concepts without collisions
 
 
 
-### 🔹 3. ODE Function — *Flujo Dinámico del Pensamiento*
+### 🔹 3. ODE Function — *Dynamic Flow of Thought*
 
-El corazón del sistema: el estado `h` evoluciona según una ecuación diferencial ordinaria:
+At the system’s core, the hidden state `h` evolves according to an ordinary differential equation:
 
 [
 \frac{dh}{dt} = f_\theta(h, t)
 ]
 
-* Usa **red neural suave (Tanh)** como función dinámica
-* Integra con método **Dormand–Prince (Runge-Kutta 5º orden)**
-* **"Pensar" = fluir en el espacio conceptual** hasta converger en una idea estable
+* Uses a **smooth neural network (Tanh)** as the dynamic function
+* Integrated via **Dormand–Prince (5th-order Runge-Kutta)**
+* **“Thinking” = flowing through conceptual space** until converging to a stable idea
 
-⏱️ Profundidad adaptativa:
-Problemas simples convergen rápido; problemas complejos requieren más pasos.
+⏱️ **Adaptive depth:**
+Simple problems converge quickly; complex ones require more integration steps.
 
 
 
-### 🔹 4. Attractor Memory — *Atención Geométrica Implícita*
+### 🔹 4. Attractor Memory — *Implicit Geometric Attention*
 
-Memoria explícita basada en **fuerzas físicas** entre el estado y los atractores.
+An **explicit memory system** based on physical-like forces between the current state and stored attractors.
 
-**Cada atractor = {centro, energía, radio, contador, texto}**
+**Each attractor = {center, energy, radius, counter, text}**
 
-Durante la integración:
+During integration:
 
-* Se buscan los **K atractores más cercanos** (`K=50`)
-* Se calculan **fuerzas gaussianas** que guían el flujo hacia conceptos relevantes
-* La atención **emerge naturalmente** sin `Q`, `K`, `V`, ni `softmax`.
+* Finds the **K nearest attractors** (`K=50`)
+* Computes **Gaussian forces** pulling the state toward relevant attractors
+* Attention **emerges naturally** — no `Q`, `K`, `V`, or `softmax`
 
-💡 **Complejidad:** O(K) (≈ constante)
-💭 **Interpretación:** Es “atención física”, no matemática.
+💡 **Complexity:** O(K) (≈ constant)
+💭 **Interpretation:** It’s *physical attention*, not mathematical attention.
 
----
 
-### 🔹 5. Decoder Network — *Salida*
 
-Reconstruye los coeficientes wavelet → señal → texto.
+### 🔹 5. Decoder Network — *Output*
+
+Reconstructs wavelet coefficients → signal → text.
 
 ```text
 10000 → 8000 → 6000 → 4000 → 2048
 ```
 
-* MLP simétrico con `GELU` + `Tanh`
-* Transformada wavelet inversa → texto UTF-8
+* Symmetric MLP with `GELU` + final `Tanh`
+* Inverse wavelet transform → UTF-8 text reconstruction
 
 
-## 🎓 Entrenamiento
 
-**Función de pérdida total:**
+## 🎓 Training
+
+**Total loss function:**
+
 [
-L = L_\text{reconstrucción} + 0.1 L_\text{suavidad} + 0.05 L_\text{estabilidad}
+L = L_\text{reconstruction} + 0.1 L_\text{smoothness} + 0.05 L_\text{stability}
 ]
 
-* `AdamW` con `lr=3e-4`, clipping y *cosine decay*
-* *Curriculum learning* por fases (autoencoding → memoria → contexto largo)
-* *Mixed precision* y *gradient accumulation* (batch efectivo ≈ 512)
-* Mantenimiento periódico de atractores (pruning, fusión, consolidación)
+* Optimizer: `AdamW` with `lr=3e-4`, gradient clipping, and cosine decay
+* *Curriculum learning* by phases: (autoencoding → memory → long context)
+* *Mixed precision* + *gradient accumulation* (effective batch ≈ 512)
+* Periodic attractor maintenance (pruning, merging, consolidation)
 
 
 
-## 🔍 Inferencia (Forward Pass)
+## 🔍 Inference (Forward Pass)
 
-1. Texto → Wavelets (encoder)
-2. Proyección → Espacio de fase (embedding)
-3. Integración ODE con fuerzas de atractores
-4. Estado final → Decoder → Wavelets inversas → Texto
+1. Text → Wavelets (encoder)
+2. Projection → Phase space (embedding)
+3. ODE integration with attractor forces
+4. Final state → Decoder → Inverse wavelets → Text
 
-**Latencia típica (modelo base, 1B params):**
+**Typical latency (base model, 1B params):**
 
 ```
 Encoding: 5 ms
@@ -137,60 +141,60 @@ Decoding: 5 ms
 Total: ~40 ms
 ```
 
-➡️ 5× más rápido que un transformer en contexto largo.
+➡️ Roughly **5× faster** than transformers on long-context tasks.
 
 
 
-## 🚀 Ventajas Clave
+## 🚀 Key Advantages
 
-| Aspecto           | Transformers        | **NCFA**                        |
-| ----------------- | ------------------- | ------------------------------- |
-| Representación    | Tokens discretos    | Wavelets continuas              |
-| Atención          | O(n²), QKV, softmax | O(K), fuerzas geométricas       |
-| Contexto          | Ventana fija        | Ilimitado (memoria persistente) |
-| Memoria           | Implícita           | Explícita e inspeccionable      |
-| Multimodalidad    | Encoders separados  | Wavelets unificadas             |
-| Interpretabilidad | Attention maps      | Trayectorias + atractores       |
-| Complejidad       | Cuadrática          | Lineal O(n)                     |
-
-
-
-## 🧭 Modelos Disponibles
-
-| Versión  | Parámetros | Dim. Fase | Atractores | Uso               |
-| -------- | ---------- | --------- | ---------- | ----------------- |
-| 🪶 Nano  | 100M       | 64        | 100        | Proof of concept  |
-| 🧩 Tiny  | 1B         | 1K        | 1K         | Experimentos      |
-| ⚙️ Base  | 10B        | 10K       | 10K–100K   | Modelo productivo |
-| 🧠 Large | 100B       | 50K       | 1M–10M     | Escala GPT-4      |
+| Aspect           | Transformers        | **NCFA**                        |
+| ---------------- | ------------------- | ------------------------------- |
+| Representation   | Discrete tokens     | Continuous wavelets             |
+| Attention        | O(n²), QKV, softmax | O(K), geometric forces          |
+| Context          | Fixed window        | Unlimited (persistent memory)   |
+| Memory           | Implicit            | Explicit & inspectable          |
+| Multimodality    | Separate encoders   | Unified wavelet representation  |
+| Interpretability | Attention maps      | Phase trajectories + attractors |
+| Complexity       | Quadratic           | Linear O(n)                     |
 
 
 
-## ⚠️ Desafíos Actuales
+## 🧭 Model Configurations
 
-* Estabilidad numérica de ODEs (requiere regularización y clipping)
-* Entrenamiento más lento (≈2× backprop ODE)
-* Decoder difícil de estabilizar
-* Gestión eficiente de millones de atractores
-* Falta de infraestructura madura (torchdiffeq, geoopt limitados)
-* Validación empírica limitada — arquitectura teórica
-
-
-
-## 🧩 Conclusión
-
-**NCFA redefine el procesamiento del lenguaje.**
-El lenguaje ya no son tokens discretos, sino **flujos continuos de información** que se autoorganizan en un espacio geométrico.
-La atención no es una operación explícita: es **una propiedad emergente del sistema**.
-
-Si logra escalar, **NCFA podría ser el paradigma posterior a los transformers**:
-más rápido, con contexto ilimitado, memoria real y multimodalidad nativa.
+| Version      | Parameters | Phase Dim. | Attractors | Use Case         |
+| ------------ | ---------- | ---------- | ---------- | ---------------- |
+| 🪶 **Nano**  | 100M       | 64         | 100        | Proof of concept |
+| 🧩 **Tiny**  | 1B         | 1K         | 1K         | Experiments      |
+| ⚙️ **Base**  | 10B        | 10K        | 10K–100K   | Production model |
+| 🧠 **Large** | 100B       | 50K        | 1M–10M     | GPT-4 scale      |
 
 
 
-### 📜 Cita Propuesta
+## ⚠️ Current Challenges
+
+* **Numerical stability** in ODEs (requires regularization and gradient clipping)
+* **Slower training** (≈2× backpropagation cost through ODEs)
+* **Difficult decoder stabilization**
+* **Efficient attractor management** at large scale
+* **Limited library support** (`torchdiffeq`, `geoopt`, etc.)
+* **Limited empirical validation** — currently a theoretical architecture
+
+
+
+## 🧩 Conclusion
+
+**NCFA redefines language processing.**
+Language is no longer a sequence of discrete tokens — it’s a **continuous flow of information** evolving in a geometric phase space.
+Attention is not an explicit operation; it’s **an emergent physical property** of the system.
+
+If it scales successfully, **NCFA could represent the paradigm after transformers** —
+faster, context-unlimited, memory-persistent, and naturally multimodal.
+
+
+
+### 📜 Suggested Citation
 
 > **"Beyond Tokens and Attention: Neural Continuous Flow Architecture with Geometric Implicit Attention"**
-> Un modelo continuo con atención emergente, complejidad O(n) y memoria persistente.
-
+> A continuous model with emergent attention, O(n) complexity, and persistent memory.
+> — *[Joaquín Stürtz], 2025*
 
